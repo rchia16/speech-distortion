@@ -1,0 +1,19 @@
+name: coqui-blabber
+channels:
+  - conda-forge
+dependencies:
+  - python=3.10
+  - pip
+  - setuptools<75
+  - wheel
+  - libsndfile
+  - ffmpeg
+  - pip:
+      - numpy<2
+      - scipy<1.14
+      - soundfile>=0.12,<0.14
+      - torch==2.4.1
+      - torchaudio==2.4.1
+      - transformers==4.57.1
+      - coqui-tts==0.27.5
+      - gruut
