@@ -1,0 +1,44 @@
+pipeline:
+  sample_rate_hz: 24000
+  device: "cuda"
+  preserve_total_duration: true
+  target_latency_ms: 1000
+
+severity:
+  global_severity: 0.5
+  complexity_slope: 0.3
+  distortion_bias: 0.4
+  substitution_bias: 0.3
+  addition_bias: 0.1
+  vowel_lengthening_bias: 0.2
+  consonant_lengthening_bias: 0.2
+
+alignment:
+  runtime_backend: "torchaudio_ctc"
+  offline_backend: "mfa"
+  emit_phone_confidence: true
+
+phonology:
+  g2p_backend: "espeak_ng"
+  language: "en-us"
+  compute_complexity: true
+
+editing:
+  source_editor_backend: "parselmouth_psola"
+  enable_vowel_lengthening: true
+  enable_consonant_lengthening: true
+  enable_distortion_shaping: true
+
+resynthesis:
+  backend: "xtts"
+  use_context_phones: 1
+  max_fragment_ms: 500
+
+timbre:
+  backend: "rvc"
+  enabled: true
+
+stitching:
+  crossfade_ms: 15
+  smooth_energy: true
+  smooth_f0: true

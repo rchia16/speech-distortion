@@ -1,0 +1,86 @@
+[
+  {
+    "audio_path": "../en.text-to-speech.online/aus-en_man/aus-en_man_bath_trim.wav",
+    "transcript": "bath",
+    "phoneme_count": 3,
+    "phonemes": ["B", "AE", "TH"]
+  },
+  {
+    "audio_path": "../en.text-to-speech.online/aus-en_man/aus-en_man_food_trim.wav",
+    "transcript": "food",
+    "phoneme_count": 3,
+    "phonemes": ["F", "UW", "D"]
+  },
+  {
+    "audio_path": "../en.text-to-speech.online/aus-en_man/aus-en_man_go_trim.wav",
+    "transcript": "go",
+    "phoneme_count": 2,
+    "phonemes": ["G", "OW"]
+  },
+  {
+    "audio_path": "../en.text-to-speech.online/aus-en_man/aus-en_man_help_trim.wav",
+    "transcript": "help",
+    "phoneme_count": 4,
+    "phonemes": ["HH", "EH", "L", "P"]
+  },
+  {
+    "audio_path": "../en.text-to-speech.online/aus-en_man/aus-en_man_no_trim.wav",
+    "transcript": "no",
+    "phoneme_count": 2,
+    "phonemes": ["N", "OW"]
+  },
+  {
+    "audio_path": "../en.text-to-speech.online/aus-en_man/aus-en_man_pain_trim.wav",
+    "transcript": "pain",
+    "phoneme_count": 3,
+    "phonemes": ["P", "EY", "N"]
+  },
+  {
+    "audio_path": "../en.text-to-speech.online/aus-en_man/aus-en_man_stop_trim.wav",
+    "transcript": "stop",
+    "phoneme_count": 4,
+    "phonemes": ["S", "T", "OW", "P"]
+  },
+  {
+    "audio_path": "../en.text-to-speech.online/aus-en_man/aus-en_man_yes_trim.wav",
+    "transcript": "yes",
+    "phoneme_count": 3,
+    "phonemes": ["Y", "EH", "S"]
+  },
+  {
+    "audio_path": "../en.text-to-speech.online/aus-en_woman/aus-en_woman_bath_trim.wav",
+    "transcript": "bath",
+    "phoneme_count": 3,
+    "phonemes": ["B", "AE", "TH"]
+  },
+  {
+    "audio_path": "../en.text-to-speech.online/aus-en_woman/aus-en_woman_food_trim.wav",
+    "transcript": "food",
+    "phoneme_count": 3,
+    "phonemes": ["F", "UW", "D"]
+  },
+  {
+    "audio_path": "../en.text-to-speech.online/aus-en_woman/aus-en_woman_help_trim.wav",
+    "transcript": "help",
+    "phoneme_count": 4,
+    "phonemes": ["HH", "EH", "L", "P"]
+  },
+  {
+    "audio_path": "../en.text-to-speech.online/aus-en_woman/aus-en_woman_no_trim.wav",
+    "transcript": "no",
+    "phoneme_count": 2,
+    "phonemes": ["N", "OW"]
+  },
+  {
+    "audio_path": "../en.text-to-speech.online/aus-en_woman/aus-en_woman_stop_trim.wav",
+    "transcript": "stop",
+    "phoneme_count": 4,
+    "phonemes": ["S", "T", "OW", "P"]
+  },
+  {
+    "audio_path": "../en.text-to-speech.online/aus-en_woman/aus-en_woman_yes_trim.wav",
+    "transcript": "yes",
+    "phoneme_count": 3,
+    "phonemes": ["Y", "EH", "S"]
+  }
+]

@@ -1,0 +1,821 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import argparse
+import csv
+import itertools
+import json
+import subprocess
+import sys
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, Sequence
+
+import numpy as np
+
+ROOT = Path(__file__).resolve().parent
+SRC = ROOT / "src"
+if str(SRC) not in sys.path:
+    sys.path.insert(0, str(SRC))
+
+from speech_distortion_pipeline.io import WavAudioReader, WavAudioWriter
+from speech_distortion_pipeline.models import AudioBuffer
+from speech_distortion_pipeline.phonology.blabber_config import (
+    COQUI_CLONE_MODEL_NAME,
+    COQUI_ENV_NAME,
+    COQUI_MODEL_NAME,
+    MISMATCH_INSERTION_PHONES,
+    PHONE_SUBSTITUTIONS,
+    PHONE_TO_CLONE_TEXT,
+    PHONE_TO_IPA,
+)
+from speech_distortion_pipeline.phonology.g2p import HeuristicEnglishG2P
+from speech_distortion_pipeline.phonology.phone_distance_reference import (
+    bucketed_phone_choice,
+    bucketed_phone_sequence,
+    GLOBAL_BLABBER_PRESET_COUNT,
+    quality_for_global_blabber_preset,
+    ranked_neighbors_from_reference,
+    resolve_per_phoneme_blabber_sequences,
+    resolve_phone_blabber_sequence,
+    resolve_soft_global_blabber_sequences,
+)
+from speech_distortion_pipeline.resynthesis.fragment_synthesizer import (
+    CoquiFragmentSynthesizer,
+    CoquiSynthesisError,
+    resolve_conda_command,
+)
+
+
+@dataclass
+class ManifestEntry:
+    audio_path: Path
+    transcript: str
+    phoneme_count: int
+
+
+def clamp_unit(value: float) -> float:
+    return max(0.0, min(1.0, value))
+
+
+def clamp(samples: np.ndarray) -> np.ndarray:
+    return np.clip(samples, -1.0, 1.0)
+
+
+def to_numpy(audio: AudioBuffer) -> np.ndarray:
+    return np.asarray(audio.samples, dtype=np.float32)
+
+
+def from_numpy(samples: np.ndarray, template: AudioBuffer, **metadata: str) -> AudioBuffer:
+    merged = dict(template.metadata)
+    merged.update(metadata)
+    return AudioBuffer(
+        samples=clamp(samples).astype(np.float32).tolist(),
+        sample_rate_hz=template.sample_rate_hz,
+        channel_count=template.channel_count,
+        speaker_id=template.speaker_id,
+        metadata=merged,
+    )
+
+
+def resample_array(samples: np.ndarray, target_length: int) -> np.ndarray:
+    if target_length <= 0:
+        return np.zeros(0, dtype=np.float32)
+    if samples.size == 0:
+        return np.zeros(target_length, dtype=np.float32)
+    if samples.size == target_length:
+        return samples.astype(np.float32, copy=True)
+    if samples.size == 1:
+        return np.full(target_length, float(samples[0]), dtype=np.float32)
+
+    src_positions = np.linspace(0.0, 1.0, num=samples.size, endpoint=True)
+    dst_positions = np.linspace(0.0, 1.0, num=target_length, endpoint=True)
+    return np.interp(dst_positions, src_positions, samples).astype(np.float32)
+
+
+def _detect_activity_window(samples: np.ndarray, sample_rate_hz: int) -> tuple[int, int]:
+    if samples.size == 0:
+        return 0, 0
+    envelope_window = max(1, int(round(sample_rate_hz * 0.01)))
+    kernel = np.ones(envelope_window, dtype=np.float32) / float(envelope_window)
+    envelope = np.convolve(np.abs(samples), kernel, mode="same")
+    peak = float(np.max(envelope))
+    if peak <= 1e-8:
+        return 0, samples.size
+    threshold = max(peak * 0.08, 1e-4)
+    active = np.flatnonzero(envelope >= threshold)
+    if active.size == 0:
+        return 0, samples.size
+    pad = max(1, int(round(sample_rate_hz * 0.01)))
+    start = max(0, int(active[0]) - pad)
+    end = min(samples.size, int(active[-1]) + pad + 1)
+    if end <= start:
+        return 0, samples.size
+    return start, end
+
+
+def _select_boundary_indices(scores: np.ndarray, count: int, min_gap: int) -> list[int]:
+    if count <= 0 or scores.size == 0:
+        return []
+    ranked = list(np.argsort(scores)[::-1])
+    selected: list[int] = []
+    for candidate in ranked:
+        if scores[candidate] <= 0.0:
+            continue
+        if any(abs(candidate - existing) < min_gap for existing in selected):
+            continue
+        selected.append(int(candidate))
+        if len(selected) >= count:
+            break
+    return sorted(selected)
+
+
+def _audio_segment_boundaries(
+    samples: np.ndarray,
+    sample_rate_hz: int,
+    segment_count: int,
+) -> list[int]:
+    if segment_count <= 1 or samples.size <= 1:
+        return [0, max(1, samples.size)]
+
+    active_start, active_end = _detect_activity_window(samples, sample_rate_hz)
+    active_length = max(1, active_end - active_start)
+    frame_length = min(max(64, int(round(sample_rate_hz * 0.025))), max(64, active_length))
+    hop_length = max(32, int(round(sample_rate_hz * 0.005)))
+    if active_length <= frame_length:
+        return [0] + [
+            int(round(samples.size * index / float(segment_count)))
+            for index in range(1, segment_count)
+        ] + [samples.size]
+
+    window = np.hanning(frame_length).astype(np.float32)
+    frame_starts = list(range(active_start, max(active_start + 1, active_end - frame_length + 1), hop_length))
+    if not frame_starts:
+        return [0] + [
+            int(round(samples.size * index / float(segment_count)))
+            for index in range(1, segment_count)
+        ] + [samples.size]
+
+    flux_values: list[float] = []
+    rms_values: list[float] = []
+    previous_magnitude: np.ndarray | None = None
+    for frame_start in frame_starts:
+        frame = samples[frame_start : frame_start + frame_length]
+        if frame.shape[0] < frame_length:
+            frame = np.pad(frame, (0, frame_length - frame.shape[0]))
+        spectrum = np.abs(np.fft.rfft(frame * window))
+        if previous_magnitude is None:
+            flux_values.append(0.0)
+        else:
+            flux_values.append(float(np.sum(np.maximum(0.0, spectrum - previous_magnitude))))
+        previous_magnitude = spectrum
+        rms_values.append(float(np.sqrt(np.mean(np.square(frame))) + 1e-8))
+
+    flux = np.asarray(flux_values, dtype=np.float32)
+    rms = np.asarray(rms_values, dtype=np.float32)
+    if flux.size == 0:
+        return [0] + [
+            int(round(samples.size * index / float(segment_count)))
+            for index in range(1, segment_count)
+        ] + [samples.size]
+    flux = flux / float(np.max(flux) + 1e-8)
+    rms_delta = np.abs(np.diff(rms, prepend=rms[:1]))
+    rms_delta = rms_delta / float(np.max(rms_delta) + 1e-8)
+    novelty = (0.8 * flux) + (0.2 * rms_delta)
+    if novelty.size >= 3:
+        novelty = np.convolve(novelty, np.array([0.25, 0.5, 0.25], dtype=np.float32), mode="same")
+
+    min_gap = max(1, int(round(len(frame_starts) / float(segment_count * 2))))
+    chosen = _select_boundary_indices(novelty[1:-1], segment_count - 1, min_gap)
+    chosen = [index + 1 for index in chosen]
+
+    while len(chosen) < segment_count - 1:
+        existing_positions = [active_start] + [
+            min(active_end - 1, frame_starts[index] + (frame_length // 2))
+            for index in chosen
+        ] + [active_end]
+        existing_positions.sort()
+        largest_gap_index = max(
+            range(len(existing_positions) - 1),
+            key=lambda idx: existing_positions[idx + 1] - existing_positions[idx],
+        )
+        midpoint = int(round((existing_positions[largest_gap_index] + existing_positions[largest_gap_index + 1]) * 0.5))
+        nearest_index = min(
+            range(len(frame_starts)),
+            key=lambda idx: abs((frame_starts[idx] + (frame_length // 2)) - midpoint),
+        )
+        if nearest_index not in chosen and 0 < nearest_index < len(frame_starts) - 1:
+            chosen.append(nearest_index)
+            chosen.sort()
+        else:
+            break
+
+    boundaries = [0]
+    for frame_index in chosen[: segment_count - 1]:
+        center = frame_starts[frame_index] + (frame_length // 2)
+        boundaries.append(int(min(samples.size - 1, max(1, center))))
+    boundaries.append(samples.size)
+    boundaries = sorted(boundaries)
+
+    for index in range(1, len(boundaries)):
+        if boundaries[index] <= boundaries[index - 1]:
+            boundaries[index] = min(samples.size, boundaries[index - 1] + 1)
+    boundaries[-1] = samples.size
+    boundaries[0] = 0
+    return boundaries
+
+
+def derive_phone_sample_spans(
+    audio: AudioBuffer,
+    phones: Sequence[str],
+) -> list[tuple[int, int, str]]:
+    if not phones:
+        return []
+    total_samples = len(audio.samples)
+    if total_samples <= 0:
+        return []
+
+    boundaries = _audio_segment_boundaries(
+        to_numpy(audio),
+        audio.sample_rate_hz,
+        len(phones),
+    )
+    spans: list[tuple[int, int, str]] = []
+    for index, phone in enumerate(phones):
+        start = boundaries[index]
+        end = boundaries[index + 1] if index + 1 < len(boundaries) else total_samples
+        spans.append((start, max(start + 1, min(total_samples, end)), phone))
+    if spans:
+        spans[-1] = (spans[-1][0], total_samples, spans[-1][2])
+    return spans
+
+
+def mutate_phone(phone: str, severity: float) -> str:
+    quality = 1.0 - clamp_unit(severity)
+    return bucketed_phone_choice(
+        phone,
+        quality,
+        fallback_choices=PHONE_SUBSTITUTIONS.get(phone, ()),
+    )
+
+
+def phone_mismatch_candidates(phone: str) -> list[str]:
+    ranked = ranked_neighbors_from_reference(phone)[:4]
+    if ranked:
+        return ranked
+    return list(PHONE_SUBSTITUTIONS.get(phone, ()))
+
+
+def build_phone_mismatch_sequence(phone: str, quality: float) -> list[str]:
+    sequence, _preset_index, _distance = resolve_phone_blabber_sequence(
+        phone,
+        clamp_unit(quality),
+        fallback_choices=PHONE_SUBSTITUTIONS.get(phone, ()),
+    )
+    return sequence
+
+
+def build_per_phoneme_blabber_sequence(
+    source_phones: Sequence[str],
+    phoneme_qualities: Sequence[float],
+) -> tuple[list[str], list[int], list[float], float, bool, list[list[str]]]:
+    candidate_sequences, preset_indices, distances, total_distance, expansion_used = resolve_per_phoneme_blabber_sequences(
+        source_phones,
+        [clamp_unit(float(value)) for value in phoneme_qualities],
+        fallback_map=PHONE_SUBSTITUTIONS,
+    )
+    mutated = [phone for sequence in candidate_sequences for phone in sequence]
+    return mutated, preset_indices, distances, total_distance, expansion_used, candidate_sequences
+
+
+def resolve_global_blabber_phone_sequence(
+    transcript: str,
+    quality: float,
+) -> tuple[str, list[str], list[str], int, bool, float]:
+    cleaned = transcript.strip()
+    if not cleaned:
+        raise ValueError("Transcript is required.")
+    if len(cleaned.split()) != 1:
+        raise ValueError("Only single-word transcripts are supported.")
+
+    g2p = HeuristicEnglishG2P()
+    source_phones = g2p.phonemize_word(cleaned)
+    if not source_phones:
+        raise ValueError("Could not derive phones from the transcript.")
+
+    candidate_sequences, preset_index, expansion_used, total_distance = resolve_soft_global_blabber_sequences(
+        source_phones,
+        quality,
+        fallback_map=PHONE_SUBSTITUTIONS,
+    )
+    mutated_phones = [phone for sequence in candidate_sequences for phone in sequence]
+    return cleaned, source_phones, mutated_phones, preset_index, expansion_used, total_distance
+
+
+def phones_to_ipa(phones: Sequence[str]) -> str:
+    try:
+        return "".join(PHONE_TO_IPA[phone] for phone in phones)
+    except KeyError as exc:
+        raise ValueError(f"No IPA mapping defined for phone '{exc.args[0]}'.") from exc
+
+
+def phones_to_clone_text(phones: Sequence[str]) -> str:
+    try:
+        return "".join(PHONE_TO_CLONE_TEXT[phone] for phone in phones)
+    except KeyError as exc:
+        raise ValueError(f"No clone-text mapping defined for phone '{exc.args[0]}'.") from exc
+
+
+def ensure_coqui_backend(env_name: str) -> None:
+    completed = subprocess.run(
+        resolve_conda_command()
+        + [
+            "run",
+            "-n",
+            env_name,
+            "python",
+            "-c",
+            "import importlib.util; raise SystemExit(0 if importlib.util.find_spec('TTS') else 1)",
+        ],
+        check=False,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    if completed.returncode != 0:
+        raise RuntimeError(
+            f"Coqui TTS is not available in conda env '{env_name}'. "
+            f"Install it there before generating blabber assets."
+        )
+
+
+def resolve_source_speaker_wav_path(audio: AudioBuffer, use_source_speaker_wav: bool) -> str | None:
+    if not use_source_speaker_wav:
+        return None
+    source_path = audio.metadata.get("source_path")
+    if not source_path:
+        raise ValueError("Source speaker_wav was requested, but the loaded audio does not expose a source path.")
+    path = Path(source_path)
+    if not path.is_file():
+        raise ValueError(f"Source speaker_wav was requested, but '{source_path}' does not exist.")
+    return str(path)
+
+
+def render_blabber_sequence(
+    audio: AudioBuffer,
+    phones: Sequence[str],
+    use_source_speaker_wav: bool,
+) -> np.ndarray:
+    if use_source_speaker_wav:
+        synthesizer = CoquiFragmentSynthesizer(
+            conda_env_name=COQUI_ENV_NAME,
+            model_name=COQUI_CLONE_MODEL_NAME,
+            speaker_wav_path=resolve_source_speaker_wav_path(audio, use_source_speaker_wav),
+        )
+        rendered = synthesizer._render_with_coqui(
+            phones_to_clone_text(phones),
+            audio.sample_rate_hz,
+            prephonemized=False,
+            language="en",
+        )
+    else:
+        synthesizer = CoquiFragmentSynthesizer(
+            conda_env_name=COQUI_ENV_NAME,
+            model_name=COQUI_MODEL_NAME,
+            speaker_wav_path=None,
+        )
+        rendered = synthesizer._render_with_coqui(
+            phones_to_ipa(phones),
+            audio.sample_rate_hz,
+            prephonemized=True,
+        )
+    if not rendered:
+        raise RuntimeError(f"Coqui synthesis produced no audio in conda env '{COQUI_ENV_NAME}'.")
+    return np.asarray(rendered, dtype=np.float32)
+
+
+def render_blabber_per_phoneme(
+    audio: AudioBuffer,
+    transcript: str,
+    phoneme_qualities: Sequence[float],
+    use_source_speaker_wav: bool = False,
+) -> tuple[AudioBuffer, list[str], list[str]]:
+    cleaned = transcript.strip()
+    if not cleaned:
+        raise ValueError("Transcript is required.")
+    if len(cleaned.split()) != 1:
+        raise ValueError("Only single-word transcripts are supported.")
+
+    g2p = HeuristicEnglishG2P()
+    source_phones = g2p.phonemize_word(cleaned)
+    if not source_phones:
+        raise ValueError("Could not derive phones from the transcript.")
+    if len(phoneme_qualities) != len(source_phones):
+        raise ValueError(
+            f"Transcript '{cleaned}' resolves to {len(source_phones)} phonemes "
+            f"({', '.join(source_phones)}), but {len(phoneme_qualities)} values were provided."
+        )
+
+    (
+        mutated_phones,
+        per_phone_preset_indices,
+        per_phone_distances,
+        total_distance,
+        expansion_used,
+        per_phone_sequences,
+    ) = build_per_phoneme_blabber_sequence(source_phones, phoneme_qualities)
+    try:
+        output = render_blabber_sequence(audio, mutated_phones, use_source_speaker_wav)
+    except CoquiSynthesisError as exc:
+        raise RuntimeError(f"Coqui synthesis failed in conda env '{COQUI_ENV_NAME}'.\n\n{exc}") from exc
+    rendered_audio = from_numpy(
+        output,
+        audio,
+        augmentation="blabber",
+        transcript=cleaned,
+        source_phones="-".join(source_phones),
+        substituted_phones="-".join(mutated_phones),
+        substituted_ipa=phones_to_ipa(mutated_phones),
+        phoneme_qualities=",".join(format_quality_token(value) for value in phoneme_qualities),
+        per_phone_preset_indices=",".join(str(int(value)) for value in per_phone_preset_indices),
+        per_phone_distances=",".join(f"{float(value):.6f}" for value in per_phone_distances),
+        per_phone_distance_total=f"{total_distance:.6f}",
+        per_phone_sequences=";".join("-".join(sequence) for sequence in per_phone_sequences),
+        expansion_used="1" if expansion_used else "0",
+        source_speaker_wav="1" if use_source_speaker_wav else "0",
+    )
+    return rendered_audio, source_phones, mutated_phones
+
+
+def render_blabber_global(
+    audio: AudioBuffer,
+    transcript: str,
+    quality: float,
+    use_source_speaker_wav: bool = False,
+) -> tuple[AudioBuffer, list[str], list[str], int, bool, float]:
+    cleaned, source_phones, mutated_phones, preset_index, expansion_used, total_distance = resolve_global_blabber_phone_sequence(
+        transcript,
+        quality,
+    )
+    try:
+        output = render_blabber_sequence(audio, mutated_phones, use_source_speaker_wav)
+    except CoquiSynthesisError as exc:
+        raise RuntimeError(f"Coqui synthesis failed in conda env '{COQUI_ENV_NAME}'.\n\n{exc}") from exc
+    rendered_audio = from_numpy(
+        output,
+        audio,
+        augmentation="blabber",
+        quality=f"{quality:.3f}",
+        transcript=cleaned,
+        source_phones="-".join(source_phones),
+        substituted_phones="-".join(mutated_phones),
+        substituted_ipa=phones_to_ipa(mutated_phones),
+        global_preset_index=str(preset_index),
+        expansion_used="1" if expansion_used else "0",
+        global_distance_total=f"{total_distance:.6f}",
+        source_speaker_wav="1" if use_source_speaker_wav else "0",
+        global_progression_policy="deterministic_distance_ladder",
+    )
+    return rendered_audio, source_phones, mutated_phones, preset_index, expansion_used, total_distance
+
+
+def format_quality_token(value: float) -> str:
+    clamped = clamp_unit(float(value))
+    text = f"{clamped:.3f}".rstrip("0").rstrip(".")
+    return text if text else "0"
+
+
+def safe_word_token(word: str) -> str:
+    return "".join(char.lower() if char.isalnum() else "_" for char in word).strip("_") or "word"
+
+
+def manifest_row_to_entry(row: dict[str, Any], manifest_path: Path) -> ManifestEntry:
+    audio_value = row.get("audio_path") or row.get("file") or row.get("path")
+    transcript = str(row.get("transcript") or row.get("word") or "").strip()
+    raw_phoneme_count = row.get("phoneme_count") or row.get("num_phonemes") or row.get("number_of_phonemes")
+
+    if not audio_value:
+        raise ValueError("Each manifest row must include 'audio_path'.")
+    if not transcript:
+        raise ValueError("Each manifest row must include 'transcript'.")
+    if raw_phoneme_count is None:
+        raise ValueError("Each manifest row must include 'phoneme_count'.")
+    phoneme_count = int(raw_phoneme_count)
+    if phoneme_count <= 0:
+        raise ValueError("'phoneme_count' must be a positive integer.")
+
+    audio_path = Path(str(audio_value))
+    if not audio_path.is_absolute():
+        audio_path = (manifest_path.parent / audio_path).resolve()
+    return ManifestEntry(
+        audio_path=audio_path,
+        transcript=transcript,
+        phoneme_count=phoneme_count,
+    )
+
+
+def load_manifest(path: Path) -> list[ManifestEntry]:
+    suffix = path.suffix.lower()
+    if suffix == ".csv":
+        with path.open("r", encoding="utf-8", newline="") as handle:
+            reader = csv.DictReader(handle)
+            return [manifest_row_to_entry(row, path) for row in reader]
+    if suffix == ".tsv":
+        with path.open("r", encoding="utf-8", newline="") as handle:
+            reader = csv.DictReader(handle, delimiter="\t")
+            return [manifest_row_to_entry(row, path) for row in reader]
+    if suffix == ".jsonl":
+        entries: list[ManifestEntry] = []
+        with path.open("r", encoding="utf-8") as handle:
+            for line_number, line in enumerate(handle, start=1):
+                stripped = line.strip()
+                if not stripped:
+                    continue
+                try:
+                    row = json.loads(stripped)
+                except json.JSONDecodeError as exc:
+                    raise ValueError(f"Invalid JSON on line {line_number} of {path}.") from exc
+                entries.append(manifest_row_to_entry(row, path))
+        return entries
+    if suffix == ".json":
+        with path.open("r", encoding="utf-8") as handle:
+            payload = json.load(handle)
+        if not isinstance(payload, list):
+            raise ValueError("JSON manifest must contain a top-level array.")
+        return [manifest_row_to_entry(row, path) for row in payload]
+    raise ValueError("Manifest must be .csv, .tsv, .json, or .jsonl")
+
+
+def spans_to_json(
+    spans: Sequence[tuple[int, int, str]],
+    sample_rate_hz: int,
+) -> list[dict[str, Any]]:
+    return [
+        {
+            "phone": phone,
+            "start_sample": start,
+            "end_sample": end,
+            "start_sec": round(start / float(sample_rate_hz), 6),
+            "end_sec": round(end / float(sample_rate_hz), 6),
+            "duration_sec": round((end - start) / float(sample_rate_hz), 6),
+        }
+        for start, end, phone in spans
+    ]
+
+
+def build_sidecar_payload(
+    input_audio_path: Path,
+    output_audio_path: Path,
+    transcript: str,
+    phoneme_values: Sequence[float],
+    source_audio: AudioBuffer,
+    rendered_audio: AudioBuffer,
+    source_phones: Sequence[str],
+    mutated_phones: Sequence[str],
+) -> dict[str, Any]:
+    source_spans = derive_phone_sample_spans(source_audio, source_phones)
+    output_spans = derive_phone_sample_spans(rendered_audio, mutated_phones)
+    return {
+        "input_audio_path": str(input_audio_path),
+        "output_audio_path": str(output_audio_path),
+        "transcript": transcript,
+        "phoneme_values": [clamp_unit(float(value)) for value in phoneme_values],
+        "source_phoneme_count": len(source_phones),
+        "output_phoneme_count": len(mutated_phones),
+        "source_phonemes": list(source_phones),
+        "output_phonemes": list(mutated_phones),
+        "source_alignment": spans_to_json(source_spans, source_audio.sample_rate_hz),
+        "output_alignment": spans_to_json(output_spans, rendered_audio.sample_rate_hz),
+        "sample_rate_hz": rendered_audio.sample_rate_hz,
+        "duration_sec": round(len(rendered_audio.samples) / float(rendered_audio.sample_rate_hz), 6),
+        "metadata": dict(rendered_audio.metadata),
+    }
+
+
+def generate_phoneme_value_sets(phoneme_count: int) -> list[list[float]]:
+    available_values = [index / 10.0 for index in range(11)]
+    if phoneme_count > len(available_values):
+        raise ValueError(
+            f"Cannot generate non-repeating 0.0-1.0 step-0.1 permutations for {phoneme_count} phonemes. "
+            f"Maximum supported phoneme_count is {len(available_values)}."
+        )
+
+    generated = [
+        [float(value) for value in combo]
+        for combo in itertools.permutations(available_values, phoneme_count)
+    ]
+    baseline = [1.0] * phoneme_count
+    if baseline not in generated:
+        generated.append(baseline)
+    return generated
+
+
+def generate_global_quality_presets(
+    preset_count: int = GLOBAL_BLABBER_PRESET_COUNT,
+) -> list[tuple[int, float]]:
+    # Generate a fixed soft-to-moderate global ladder. The resolver normalizes each preset by word length
+    # and delays 2-phone expansions until the strongest preset, which keeps longer words noticeably softer.
+    return [
+        (preset_index, quality_for_global_blabber_preset(preset_index, preset_count=preset_count))
+        for preset_index in range(preset_count)
+    ]
+
+
+def process_entry(
+    entry: ManifestEntry,
+    output_dir: Path,
+    overwrite: bool,
+    use_source_speaker_wav: bool,
+    reader: WavAudioReader,
+    writer: WavAudioWriter,
+    generation_mode: str,
+) -> dict[str, Any]:
+    if not entry.audio_path.exists():
+        raise FileNotFoundError(f"Input audio file does not exist: {entry.audio_path}")
+
+    audio = reader.read(str(entry.audio_path))
+    detected_phones = HeuristicEnglishG2P().phonemize_word(entry.transcript.strip())
+    if len(detected_phones) != entry.phoneme_count:
+        raise ValueError(
+            f"Manifest phoneme_count={entry.phoneme_count} for '{entry.transcript}' does not match "
+            f"detected phoneme count={len(detected_phones)} ({', '.join(detected_phones)})."
+        )
+
+    generated_items: list[dict[str, Any]] = []
+    stem = safe_word_token(entry.transcript)
+    if generation_mode == "global_soft":
+        for preset_index, quality in generate_global_quality_presets():
+            (
+                rendered_audio,
+                source_phones,
+                mutated_phones,
+                resolved_preset_index,
+                expansion_used,
+                total_distance,
+            ) = render_blabber_global(
+                audio,
+                entry.transcript,
+                quality,
+                use_source_speaker_wav=use_source_speaker_wav,
+            )
+
+            output_audio_path = output_dir / (
+                f"{stem}_global_p{preset_index:02d}_q{format_quality_token(quality)}.wav"
+            )
+            output_json_path = output_audio_path.with_suffix(".json")
+
+            if not overwrite and (output_audio_path.exists() or output_json_path.exists()):
+                raise FileExistsError(
+                    f"Refusing to overwrite existing output '{output_audio_path.name}'. Use --overwrite."
+                )
+
+            writer.write(str(output_audio_path), rendered_audio)
+            payload = build_sidecar_payload(
+                entry.audio_path,
+                output_audio_path,
+                entry.transcript.strip(),
+                [quality],
+                audio,
+                rendered_audio,
+                source_phones,
+                mutated_phones,
+            )
+            output_json_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+
+            generated_items.append(
+                {
+                    "transcript": entry.transcript.strip(),
+                    "audio_path": str(output_audio_path),
+                    "json_path": str(output_json_path),
+                    "source_phonemes": source_phones,
+                    "output_phonemes": mutated_phones,
+                    "quality": quality,
+                    "global_preset_index": resolved_preset_index,
+                    "expansion_used": expansion_used,
+                    "global_distance_total": total_distance,
+                }
+            )
+    else:
+        for phoneme_values in generate_phoneme_value_sets(entry.phoneme_count):
+            rendered_audio, source_phones, mutated_phones = render_blabber_per_phoneme(
+                audio,
+                entry.transcript,
+                phoneme_values,
+                use_source_speaker_wav=use_source_speaker_wav,
+            )
+
+            quality_suffix = "_".join(format_quality_token(value) for value in phoneme_values)
+            output_audio_path = output_dir / f"{stem}_{quality_suffix}.wav"
+            output_json_path = output_audio_path.with_suffix(".json")
+
+            if not overwrite and (output_audio_path.exists() or output_json_path.exists()):
+                raise FileExistsError(
+                    f"Refusing to overwrite existing output '{output_audio_path.name}'. Use --overwrite."
+                )
+
+            writer.write(str(output_audio_path), rendered_audio)
+            payload = build_sidecar_payload(
+                entry.audio_path,
+                output_audio_path,
+                entry.transcript.strip(),
+                phoneme_values,
+                audio,
+                rendered_audio,
+                source_phones,
+                mutated_phones,
+            )
+            output_json_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+
+            generated_items.append(
+                {
+                    "transcript": entry.transcript.strip(),
+                    "audio_path": str(output_audio_path),
+                    "json_path": str(output_json_path),
+                    "source_phonemes": source_phones,
+                    "output_phonemes": mutated_phones,
+                    "phoneme_values": phoneme_values,
+                }
+            )
+
+    return {
+        "transcript": entry.transcript.strip(),
+        "generated_count": len(generated_items),
+        "items": generated_items,
+    }
+
+
+def build_arg_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description=(
+            "Generate standalone blabber phoneme-mismatch assets from a manifest of "
+            "audio files, one-word transcripts, and phoneme counts."
+        )
+    )
+    parser.add_argument("--manifest", required=True, help="Path to a .csv, .tsv, .json, or .jsonl manifest.")
+    parser.add_argument(
+        "--output-dir",
+        default="speech-assets",
+        help="Directory where generated wav/json assets will be written.",
+    )
+    parser.add_argument(
+        "--overwrite",
+        action="store_true",
+        help="Overwrite existing outputs with the same generated filenames.",
+    )
+    parser.add_argument(
+        "--use-source-speaker-wav",
+        action="store_true",
+        help="Use each input WAV file as Coqui speaker_wav when generating blabber assets.",
+    )
+    parser.add_argument(
+        "--print-summary-json",
+        action="store_true",
+        help="Print the generated asset list as JSON instead of plain text.",
+    )
+    parser.add_argument(
+        "--generation-mode",
+        choices=("global_soft", "per_phoneme"),
+        default="global_soft",
+        help="Generate softened global blabber presets or the original per-phoneme permutations.",
+    )
+    return parser
+
+
+def main() -> int:
+    parser = build_arg_parser()
+    args = parser.parse_args()
+
+    manifest_path = Path(args.manifest).resolve()
+    output_dir = Path(args.output_dir).resolve()
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    ensure_coqui_backend(COQUI_ENV_NAME)
+    entries = load_manifest(manifest_path)
+    if not entries:
+        raise ValueError("Manifest did not contain any entries.")
+
+    reader = WavAudioReader()
+    writer = WavAudioWriter()
+    generated = [
+        process_entry(
+            entry,
+            output_dir,
+            args.overwrite,
+            bool(args.use_source_speaker_wav),
+            reader,
+            writer,
+            str(args.generation_mode),
+        )
+        for entry in entries
+    ]
+
+    if args.print_summary_json:
+        print(json.dumps(generated, indent=2))
+    else:
+        for item in generated:
+            print(f"{item['transcript']}: generated {item['generated_count']} assets")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -16,12 +16,15 @@ venv/
 
 dist/
 build/
+model/
 *.egg-info/
 
 *.un~
 
 *.zip
 *.wav
+*.tgz
+*.pt
 !yes.wav
 !yes_slow.wav
 !127389__acclivity__thetimehascome.wav
