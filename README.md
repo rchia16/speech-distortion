@@ -13,6 +13,7 @@ The GUI supports both global quality control and per-phoneme quality control. Fo
 
 - `speech_distortion_gui.py`: main desktop GUI
 - `build_blabber_library.py`: standalone batch generator for blabber assets
+- `select_blabber_asset.py`: local selector that maps template mismatch outputs onto pre-generated blabber assets
 - `export_phoneme_distances.py`: exports the shared phoneme-distance reference
 - `src/speech_distortion_pipeline/phonology/blabber_config.py`: shared Blabber constants used by the GUI and library builder
 - `src/speech_distortion_pipeline/phonology/phone_distance_reference.py`: shared deterministic distance resolvers for global and per-phoneme Blabber
@@ -48,9 +49,13 @@ Shared ladder counts live in `src/speech_distortion_pipeline/phonology/phone_dis
 The following environment variables override the default Coqui settings:
 
 ```powershell
-$env:BLABBER_COQUI_MODEL="tts_models/en/ljspeech/tacotron2-DDC_ph"
+$env:BLABBER_COQUI_WOMAN_MODEL="tts_models/en/ljspeech/tacotron2-DDC_ph"
+$env:BLABBER_COQUI_MAN_MODEL="tts_models/en/vctk/vits"
 $env:BLABBER_COQUI_CLONE_MODEL="tts_models/multilingual/multi-dataset/xtts_v2"
 ```
+
+`BLABBER_COQUI_MODEL` is still accepted as a backward-compatible alias for the woman preset when
+`BLABBER_COQUI_WOMAN_MODEL` is not set.
 
 ## Run The GUI
 
@@ -81,7 +86,7 @@ The default demo input is `yes_slow.wav` when present in the repo root.
 
 - requires a single-word transcript
 - uses heuristic G2P to derive the source phoneme sequence
-- supports optional source voice cloning through Coqui `speaker_wav`
+- supports preset `woman` and `man` TTS outputs plus optional source voice cloning through Coqui `speaker_wav`
 - provides a `Generate Sequence` button to preview the resolved phone sequence before rendering
 - caches the generated sequence and reuses it for the next render when inputs have not changed
 
@@ -98,11 +103,14 @@ The default demo input is `yes_slow.wav` when present in the repo root.
 
 - each slider controls only its matching source phoneme
 - each phoneme resolves through its own deterministic distance ladder using the same shared reference file
+- per-phoneme ladders now prioritize single-phone substitutions first and only introduce multi-phone expansions at the harshest presets
 - per-phoneme renders now include:
   - `per_phone_preset_indices`
   - `per_phone_distances`
   - `per_phone_distance_total`
   - `per_phone_sequences`
+  - `per_phone_numeric_entries_used`
+  - `per_phone_reference_warning`
 
 #### Distance Reference Behavior
 
@@ -111,11 +119,13 @@ The default demo input is `yes_slow.wav` when present in the repo root.
   - replacement phone sequence
   - numeric distance
   - rank
-- if numeric entries are missing, the runtime falls back to rank-based synthetic distances derived from candidate order
+- if numeric entries are missing, the runtime falls back to rank-based synthetic distances derived from candidate order and marks per-phoneme renders with a reference warning
 
 ## Standalone Blabber Library Builder
 
 `build_blabber_library.py` generates standalone Blabber assets from a manifest of input WAVs and single-word transcripts.
+The builder currently renders only the female/woman preset voice. A later male voice path is expected to be
+implemented as a post-process style-transfer stage on the generated audio, not as a second direct TTS render mode.
 
 Supported manifest formats:
 
@@ -141,7 +151,6 @@ Example runs:
 
 ```powershell
 python build_blabber_library.py --manifest blabber_manifest.csv --output-dir speech-assets
-python build_blabber_library.py --manifest blabber_manifest.csv --output-dir speech-assets --use-source-speaker-wav
 ```
 
 Current behavior:
@@ -151,13 +160,85 @@ Current behavior:
 - per-phoneme deterministic ladders use `PER_PHONEME_BLABBER_PRESET_COUNT`
 - per-phoneme generation remains available as the original combinatorial mode
 - generated Blabber metadata includes global or per-phone distance information depending on generation mode
+- generated Blabber metadata now also includes `voice_mode`, `coqui_model_name`, and a `style_transfer` placeholder block
+- each generated asset also writes a `.json` sidecar with:
+  - `phoneme_values`
+  - `source_phonemes`
+  - `source_alignment`
+  - `output_alignment`
+  - `output_audio_path`
 
 Notes:
 
 - `transcript` must currently be a single word
 - `phoneme_count` must exactly match the detected source phoneme count for that word
 - Coqui must be installed in the configured `BLABBER_CONDA_ENV`
-- `--use-source-speaker-wav` uses each manifest input WAV as the Coqui reference voice
+- the builder currently uses only the configured woman preset model
+- sidecar JSON includes `style_transfer.backend/status/target_voice` so a later male voice-conversion stage can be added after female Blabber generation
+
+## Blabber Asset Selection From Template Mismatch
+
+`select_blabber_asset.py` selects a pre-generated male or female Blabber asset for a known target word from the output of either:
+
+- `Template_l2_compare.py`
+- `Template_l2_compare_v2.py`
+
+The selector is local-path based and does not hard-code external dataset roots. It expects:
+
+- a saved comparison result payload from `compare_signal_to_prebuilt_template(...)`
+- a local JSON asset index
+- a requested voice bank: `female`/`woman` or `male`/`man`
+- a known target word, or a `label_name` already present in the comparison result
+
+Selection behavior:
+
+- supports both template result shapes
+- uses the comparison `times` and `per_time_l2` arrays as the mismatch timeline
+- uses asset `source_alignment` sidecars to estimate phoneme spans
+- averages mismatch within each phoneme span
+- rounds each phoneme mismatch to the nearest `0.1`
+- prefers an exact per-phoneme grade match and otherwise falls back to the nearest available asset
+
+Example:
+
+- if a 2-phoneme word has mismatch `0.5` over the first phoneme span and `0.2` over the second, the selector requests the asset with phoneme grades `[0.5, 0.2]`
+
+Example run:
+
+```powershell
+python select_blabber_asset.py `
+  --comparison-result compare_go_v2.json `
+  --asset-index blabber_asset_index.json `
+  --voice female `
+  --word go `
+  --output-json selected_go_asset.json
+```
+
+The selector prints JSON to stdout and can optionally save the same result to `--output-json`.
+
+Expected asset index fields per item:
+
+- `word` or `transcript`
+- `voice_mode`
+- `phoneme_values`
+- `audio_path`
+- `sidecar_path` or `json_path`
+- `source_phonemes`
+
+The asset index can be either:
+
+- a flat array of items
+- the nested summary shape produced by `build_blabber_library.py --print-summary-json`
+
+The selection result includes:
+
+- selected `audio_path`
+- selected `sidecar_path`
+- requested phoneme grades
+- selected asset phoneme grades
+- phoneme timing spans and mean mismatch values
+- `exact_match`
+- selection distance metadata
 
 ## Phoneme Distance Reference Export
 
@@ -188,6 +269,7 @@ Notes:
 - ACN phone distance uses `model/embedder-64` by default and auto-extracts it from `model.tgz` when available
 - override the ACN model path with `ACN_EMBED_MODEL_DIR`
 - regenerate `phoneme_distances.json` after exporter changes if you want live GUI/library behavior to use the newest numeric distances
+- regenerate `phoneme_distances.json` if you see `per_phone_reference_warning=1`, because legacy candidate ordering can make per-phoneme ladders less smooth
 
 ## Notes And Limitations
 

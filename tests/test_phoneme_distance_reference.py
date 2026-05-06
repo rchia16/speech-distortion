@@ -166,6 +166,32 @@ def test_build_phone_blabber_ladder_samples_distinct_distance_steps(tmp_path: Pa
     assert [entry["distance"] for entry in ladder] == [0.0, 0.1, 0.2, 0.3]
 
 
+def test_build_phone_blabber_ladder_samples_direct_ranked_candidates_from_source_phone(tmp_path: Path) -> None:
+    payload = [
+        {
+            "phone": "S",
+            "ranked_candidate_entries_near_to_far": [
+                {"phones": ["SH"], "distance": 0.1, "rank": 0},
+                {"phones": ["F", "Z"], "distance": 0.2, "rank": 1},
+                {"phones": ["Z"], "distance": 0.3, "rank": 2},
+                {"phones": ["Z", "T"], "distance": 0.4, "rank": 3},
+            ],
+        }
+    ]
+    reference_path = tmp_path / "phoneme_distances.json"
+    reference_path.write_text(json.dumps(payload), encoding="utf-8")
+
+    ladder = build_phone_blabber_ladder("S", reference_path=str(reference_path), preset_count=5)
+
+    assert [entry["candidate_sequence"] for entry in ladder] == [
+        ["S"],
+        ["SH"],
+        ["F", "Z"],
+        ["Z"],
+        ["Z", "T"],
+    ]
+
+
 def test_resolve_phone_blabber_sequence_maps_quality_to_per_phone_step(tmp_path: Path) -> None:
     payload = [
         {
@@ -220,7 +246,7 @@ def test_resolve_per_phoneme_blabber_sequences_returns_per_phone_steps_and_dista
     reference_path = tmp_path / "phoneme_distances.json"
     reference_path.write_text(json.dumps(payload), encoding="utf-8")
 
-    sequences, preset_indices, distances, total_distance, expansion_used = resolve_per_phoneme_blabber_sequences(
+    sequences, preset_indices, distances, total_distance, expansion_used, numeric_entries_used = resolve_per_phoneme_blabber_sequences(
         ["S", "T"],
         [0.66, 0.33],
         reference_path=str(reference_path),
@@ -232,3 +258,33 @@ def test_resolve_per_phoneme_blabber_sequences_returns_per_phone_steps_and_dista
     assert distances == [0.1, 0.3]
     assert total_distance == 0.4
     assert expansion_used is False
+    assert numeric_entries_used is True
+
+
+def test_resolve_per_phoneme_blabber_sequences_marks_legacy_reference_fallback(tmp_path: Path) -> None:
+    payload = [
+        {
+            "phone": "S",
+            "ranked_candidates_near_to_far": [["SH"], ["Z"], ["SH", "Z"]],
+        },
+        {
+            "phone": "T",
+            "ranked_neighbors_near_to_far": ["D", "K"],
+        },
+    ]
+    reference_path = tmp_path / "phoneme_distances.json"
+    reference_path.write_text(json.dumps(payload), encoding="utf-8")
+
+    sequences, preset_indices, distances, total_distance, expansion_used, numeric_entries_used = resolve_per_phoneme_blabber_sequences(
+        ["S", "T"],
+        [0.66, 0.33],
+        reference_path=str(reference_path),
+        preset_count=4,
+    )
+
+    assert sequences == [["SH"], ["K"]]
+    assert preset_indices == [1, 2]
+    assert distances == [1.0, 2.0]
+    assert total_distance == 3.0
+    assert expansion_used is False
+    assert numeric_entries_used is False

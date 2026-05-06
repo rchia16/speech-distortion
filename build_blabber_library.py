@@ -21,13 +21,12 @@ if str(SRC) not in sys.path:
 from speech_distortion_pipeline.io import WavAudioReader, WavAudioWriter
 from speech_distortion_pipeline.models import AudioBuffer
 from speech_distortion_pipeline.phonology.blabber_config import (
-    COQUI_CLONE_MODEL_NAME,
     COQUI_ENV_NAME,
-    COQUI_MODEL_NAME,
     MISMATCH_INSERTION_PHONES,
     PHONE_SUBSTITUTIONS,
     PHONE_TO_CLONE_TEXT,
     PHONE_TO_IPA,
+    resolve_blabber_voice_profile,
 )
 from speech_distortion_pipeline.phonology.g2p import HeuristicEnglishG2P
 from speech_distortion_pipeline.phonology.phone_distance_reference import (
@@ -45,6 +44,8 @@ from speech_distortion_pipeline.resynthesis.fragment_synthesizer import (
     CoquiSynthesisError,
     resolve_conda_command,
 )
+
+LIBRARY_BLABBER_VOICE_MODE = "woman"
 
 
 @dataclass
@@ -278,14 +279,14 @@ def build_phone_mismatch_sequence(phone: str, quality: float) -> list[str]:
 def build_per_phoneme_blabber_sequence(
     source_phones: Sequence[str],
     phoneme_qualities: Sequence[float],
-) -> tuple[list[str], list[int], list[float], float, bool, list[list[str]]]:
-    candidate_sequences, preset_indices, distances, total_distance, expansion_used = resolve_per_phoneme_blabber_sequences(
+) -> tuple[list[str], list[int], list[float], float, bool, list[list[str]], bool]:
+    candidate_sequences, preset_indices, distances, total_distance, expansion_used, numeric_entries_used = resolve_per_phoneme_blabber_sequences(
         source_phones,
         [clamp_unit(float(value)) for value in phoneme_qualities],
         fallback_map=PHONE_SUBSTITUTIONS,
     )
     mutated = [phone for sequence in candidate_sequences for phone in sequence]
-    return mutated, preset_indices, distances, total_distance, expansion_used, candidate_sequences
+    return mutated, preset_indices, distances, total_distance, expansion_used, candidate_sequences, numeric_entries_used
 
 
 def resolve_global_blabber_phone_sequence(
@@ -364,41 +365,30 @@ def resolve_source_speaker_wav_path(audio: AudioBuffer, use_source_speaker_wav: 
 def render_blabber_sequence(
     audio: AudioBuffer,
     phones: Sequence[str],
-    use_source_speaker_wav: bool,
-) -> np.ndarray:
-    if use_source_speaker_wav:
-        synthesizer = CoquiFragmentSynthesizer(
-            conda_env_name=COQUI_ENV_NAME,
-            model_name=COQUI_CLONE_MODEL_NAME,
-            speaker_wav_path=resolve_source_speaker_wav_path(audio, use_source_speaker_wav),
-        )
-        rendered = synthesizer._render_with_coqui(
-            phones_to_clone_text(phones),
-            audio.sample_rate_hz,
-            prephonemized=False,
-            language="en",
-        )
-    else:
-        synthesizer = CoquiFragmentSynthesizer(
-            conda_env_name=COQUI_ENV_NAME,
-            model_name=COQUI_MODEL_NAME,
-            speaker_wav_path=None,
-        )
-        rendered = synthesizer._render_with_coqui(
-            phones_to_ipa(phones),
-            audio.sample_rate_hz,
-            prephonemized=True,
-        )
+    voice_mode: str,
+) -> tuple[np.ndarray, str]:
+    profile = resolve_blabber_voice_profile(voice_mode)
+    synthesizer = CoquiFragmentSynthesizer(
+        conda_env_name=COQUI_ENV_NAME,
+        model_name=profile.model_name,
+        speaker_wav_path=resolve_source_speaker_wav_path(audio, True) if profile.uses_source_speaker_wav else None,
+    )
+    render_text = phones_to_clone_text(phones) if profile.input_encoding == "clone_text" else phones_to_ipa(phones)
+    rendered = synthesizer._render_with_coqui(
+        render_text,
+        audio.sample_rate_hz,
+        prephonemized=profile.prephonemized,
+        language=profile.language,
+    )
     if not rendered:
         raise RuntimeError(f"Coqui synthesis produced no audio in conda env '{COQUI_ENV_NAME}'.")
-    return np.asarray(rendered, dtype=np.float32)
+    return np.asarray(rendered, dtype=np.float32), profile.model_name
 
 
 def render_blabber_per_phoneme(
     audio: AudioBuffer,
     transcript: str,
     phoneme_qualities: Sequence[float],
-    use_source_speaker_wav: bool = False,
 ) -> tuple[AudioBuffer, list[str], list[str]]:
     cleaned = transcript.strip()
     if not cleaned:
@@ -423,9 +413,10 @@ def render_blabber_per_phoneme(
         total_distance,
         expansion_used,
         per_phone_sequences,
+        per_phone_numeric_entries_used,
     ) = build_per_phoneme_blabber_sequence(source_phones, phoneme_qualities)
     try:
-        output = render_blabber_sequence(audio, mutated_phones, use_source_speaker_wav)
+        output, coqui_model_name = render_blabber_sequence(audio, mutated_phones, LIBRARY_BLABBER_VOICE_MODE)
     except CoquiSynthesisError as exc:
         raise RuntimeError(f"Coqui synthesis failed in conda env '{COQUI_ENV_NAME}'.\n\n{exc}") from exc
     rendered_audio = from_numpy(
@@ -442,7 +433,14 @@ def render_blabber_per_phoneme(
         per_phone_distance_total=f"{total_distance:.6f}",
         per_phone_sequences=";".join("-".join(sequence) for sequence in per_phone_sequences),
         expansion_used="1" if expansion_used else "0",
-        source_speaker_wav="1" if use_source_speaker_wav else "0",
+        per_phone_numeric_entries_used="1" if per_phone_numeric_entries_used else "0",
+        per_phone_reference_warning="0" if per_phone_numeric_entries_used else "1",
+        voice_mode=LIBRARY_BLABBER_VOICE_MODE,
+        coqui_model_name=coqui_model_name,
+        source_speaker_wav="0",
+        style_transfer_backend="none",
+        style_transfer_target_voice="",
+        style_transfer_status="not_requested",
     )
     return rendered_audio, source_phones, mutated_phones
 
@@ -451,14 +449,13 @@ def render_blabber_global(
     audio: AudioBuffer,
     transcript: str,
     quality: float,
-    use_source_speaker_wav: bool = False,
 ) -> tuple[AudioBuffer, list[str], list[str], int, bool, float]:
     cleaned, source_phones, mutated_phones, preset_index, expansion_used, total_distance = resolve_global_blabber_phone_sequence(
         transcript,
         quality,
     )
     try:
-        output = render_blabber_sequence(audio, mutated_phones, use_source_speaker_wav)
+        output, coqui_model_name = render_blabber_sequence(audio, mutated_phones, LIBRARY_BLABBER_VOICE_MODE)
     except CoquiSynthesisError as exc:
         raise RuntimeError(f"Coqui synthesis failed in conda env '{COQUI_ENV_NAME}'.\n\n{exc}") from exc
     rendered_audio = from_numpy(
@@ -473,8 +470,13 @@ def render_blabber_global(
         global_preset_index=str(preset_index),
         expansion_used="1" if expansion_used else "0",
         global_distance_total=f"{total_distance:.6f}",
-        source_speaker_wav="1" if use_source_speaker_wav else "0",
+        voice_mode=LIBRARY_BLABBER_VOICE_MODE,
+        coqui_model_name=coqui_model_name,
+        source_speaker_wav="0",
         global_progression_policy="deterministic_distance_ladder",
+        style_transfer_backend="none",
+        style_transfer_target_voice="",
+        style_transfer_status="not_requested",
     )
     return rendered_audio, source_phones, mutated_phones, preset_index, expansion_used, total_distance
 
@@ -588,6 +590,12 @@ def build_sidecar_payload(
         "output_alignment": spans_to_json(output_spans, rendered_audio.sample_rate_hz),
         "sample_rate_hz": rendered_audio.sample_rate_hz,
         "duration_sec": round(len(rendered_audio.samples) / float(rendered_audio.sample_rate_hz), 6),
+        "style_transfer": {
+            "backend": rendered_audio.metadata.get("style_transfer_backend", "none"),
+            "target_voice": rendered_audio.metadata.get("style_transfer_target_voice", ""),
+            "status": rendered_audio.metadata.get("style_transfer_status", "not_requested"),
+            "base_voice_mode": rendered_audio.metadata.get("voice_mode", LIBRARY_BLABBER_VOICE_MODE),
+        },
         "metadata": dict(rendered_audio.metadata),
     }
 
@@ -625,7 +633,6 @@ def process_entry(
     entry: ManifestEntry,
     output_dir: Path,
     overwrite: bool,
-    use_source_speaker_wav: bool,
     reader: WavAudioReader,
     writer: WavAudioWriter,
     generation_mode: str,
@@ -656,7 +663,6 @@ def process_entry(
                 audio,
                 entry.transcript,
                 quality,
-                use_source_speaker_wav=use_source_speaker_wav,
             )
 
             output_audio_path = output_dir / (
@@ -690,6 +696,7 @@ def process_entry(
                     "source_phonemes": source_phones,
                     "output_phonemes": mutated_phones,
                     "quality": quality,
+                    "voice_mode": rendered_audio.metadata.get("voice_mode", LIBRARY_BLABBER_VOICE_MODE),
                     "global_preset_index": resolved_preset_index,
                     "expansion_used": expansion_used,
                     "global_distance_total": total_distance,
@@ -701,7 +708,6 @@ def process_entry(
                 audio,
                 entry.transcript,
                 phoneme_values,
-                use_source_speaker_wav=use_source_speaker_wav,
             )
 
             quality_suffix = "_".join(format_quality_token(value) for value in phoneme_values)
@@ -733,6 +739,7 @@ def process_entry(
                     "json_path": str(output_json_path),
                     "source_phonemes": source_phones,
                     "output_phonemes": mutated_phones,
+                    "voice_mode": rendered_audio.metadata.get("voice_mode", LIBRARY_BLABBER_VOICE_MODE),
                     "phoneme_values": phoneme_values,
                 }
             )
@@ -761,11 +768,6 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--overwrite",
         action="store_true",
         help="Overwrite existing outputs with the same generated filenames.",
-    )
-    parser.add_argument(
-        "--use-source-speaker-wav",
-        action="store_true",
-        help="Use each input WAV file as Coqui speaker_wav when generating blabber assets.",
     )
     parser.add_argument(
         "--print-summary-json",
@@ -801,7 +803,6 @@ def main() -> int:
             entry,
             output_dir,
             args.overwrite,
-            bool(args.use_source_speaker_wav),
             reader,
             writer,
             str(args.generation_mode),

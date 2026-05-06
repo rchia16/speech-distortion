@@ -37,14 +37,15 @@ from speech_distortion_pipeline.io import WavAudioReader, WavAudioWriter
 from speech_distortion_pipeline.models import AudioBuffer
 from speech_distortion_pipeline.models.edits import EditType
 from speech_distortion_pipeline.phonology.blabber_config import (
-    COQUI_CLONE_MODEL_NAME,
+    BLABBER_VOICE_MODES,
     COQUI_ENV_NAME,
-    COQUI_MODEL_NAME,
     DEFAULT_GUI_INPUT_FILENAME,
     MISMATCH_INSERTION_PHONES,
     PHONE_SUBSTITUTIONS,
     PHONE_TO_CLONE_TEXT,
     PHONE_TO_IPA,
+    normalize_blabber_voice_mode,
+    resolve_blabber_voice_profile,
 )
 from speech_distortion_pipeline.phonology.g2p import HeuristicEnglishG2P
 from speech_distortion_pipeline.phonology.phone_distance_reference import (
@@ -776,35 +777,24 @@ def phones_to_clone_text(phones: Sequence[str]) -> str:
 def render_blabber_sequence(
     audio: AudioBuffer,
     phones: Sequence[str],
-    use_source_speaker_wav: bool,
-) -> np.ndarray:
-    if use_source_speaker_wav:
-        synthesizer = CoquiFragmentSynthesizer(
-            conda_env_name=COQUI_ENV_NAME,
-            model_name=COQUI_CLONE_MODEL_NAME,
-            speaker_wav_path=resolve_source_speaker_wav_path(audio, use_source_speaker_wav),
-        )
-        render_text = phones_to_clone_text(phones)
-        rendered = synthesizer._render_with_coqui(
-            render_text,
-            audio.sample_rate_hz,
-            prephonemized=False,
-            language="en",
-        )
-    else:
-        synthesizer = CoquiFragmentSynthesizer(
-            conda_env_name=COQUI_ENV_NAME,
-            model_name=COQUI_MODEL_NAME,
-            speaker_wav_path=None,
-        )
-        rendered = synthesizer._render_with_coqui(
-            phones_to_ipa(phones),
-            audio.sample_rate_hz,
-            prephonemized=True,
-        )
+    voice_mode: str,
+) -> tuple[np.ndarray, str]:
+    profile = resolve_blabber_voice_profile(voice_mode)
+    synthesizer = CoquiFragmentSynthesizer(
+        conda_env_name=COQUI_ENV_NAME,
+        model_name=profile.model_name,
+        speaker_wav_path=resolve_source_speaker_wav_path(audio, True) if profile.uses_source_speaker_wav else None,
+    )
+    render_text = phones_to_clone_text(phones) if profile.input_encoding == "clone_text" else phones_to_ipa(phones)
+    rendered = synthesizer._render_with_coqui(
+        render_text,
+        audio.sample_rate_hz,
+        prephonemized=profile.prephonemized,
+        language=profile.language,
+    )
     if not rendered:
         raise RuntimeError(f"Coqui synthesis produced no audio in conda env '{COQUI_ENV_NAME}'.")
-    return np.asarray(rendered, dtype=np.float32)
+    return np.asarray(rendered, dtype=np.float32), profile.model_name
 
 
 def mutate_phone(phone: str, severity: float) -> str:
@@ -836,14 +826,14 @@ def build_phone_mismatch_sequence(phone: str, quality: float) -> list[str]:
 def build_per_phoneme_blabber_sequence(
     source_phones: Sequence[str],
     phoneme_qualities: Sequence[float],
-) -> tuple[list[str], list[int], list[float], float, bool, list[list[str]]]:
-    candidate_sequences, preset_indices, distances, total_distance, expansion_used = resolve_per_phoneme_blabber_sequences(
+) -> tuple[list[str], list[int], list[float], float, bool, list[list[str]], bool]:
+    candidate_sequences, preset_indices, distances, total_distance, expansion_used, numeric_entries_used = resolve_per_phoneme_blabber_sequences(
         source_phones,
         [clamp_unit(float(value)) for value in phoneme_qualities],
         fallback_map=PHONE_SUBSTITUTIONS,
     )
     mutated = [phone for sequence in candidate_sequences for phone in sequence]
-    return mutated, preset_indices, distances, total_distance, expansion_used, candidate_sequences
+    return mutated, preset_indices, distances, total_distance, expansion_used, candidate_sequences, numeric_entries_used
 
 
 def resolve_blabber_phone_sequence(
@@ -860,6 +850,7 @@ def resolve_blabber_phone_sequence(
     list[int] | None,
     list[float] | None,
     list[list[str]] | None,
+    bool | None,
 ]:
     cleaned = transcript.strip()
     if not cleaned:
@@ -880,6 +871,7 @@ def resolve_blabber_phone_sequence(
             total_distance,
             expansion_used,
             per_phone_sequences,
+            per_phone_numeric_entries_used,
         ) = build_per_phoneme_blabber_sequence(source_phones, phoneme_qualities)
         preset_index = None
     else:
@@ -892,6 +884,7 @@ def resolve_blabber_phone_sequence(
             per_phone_preset_indices = None
             per_phone_distances = None
             per_phone_sequences = None
+            per_phone_numeric_entries_used = None
         else:
             candidate_sequences, preset_index, expansion_used, total_distance = resolve_soft_global_blabber_sequences(
                 source_phones,
@@ -902,6 +895,7 @@ def resolve_blabber_phone_sequence(
             per_phone_preset_indices = None
             per_phone_distances = None
             per_phone_sequences = None
+            per_phone_numeric_entries_used = None
     return (
         cleaned,
         source_phones,
@@ -912,6 +906,7 @@ def resolve_blabber_phone_sequence(
         per_phone_preset_indices,
         per_phone_distances,
         per_phone_sequences,
+        per_phone_numeric_entries_used,
     )
 
 
@@ -920,7 +915,7 @@ def render_blabber_from_resolved_phones(
     transcript: str,
     source_phones: Sequence[str],
     mutated_phones: Sequence[str],
-    use_source_speaker_wav: bool = False,
+    voice_mode: str = "woman",
     quality: float | None = None,
     phoneme_qualities: Sequence[float] | None = None,
     segmentation: str | None = None,
@@ -931,12 +926,14 @@ def render_blabber_from_resolved_phones(
     per_phone_preset_indices: Sequence[int] | None = None,
     per_phone_distances: Sequence[float] | None = None,
     per_phone_sequences: Sequence[Sequence[str]] | None = None,
+    per_phone_numeric_entries_used: bool | None = None,
 ) -> AudioBuffer:
     if not mutated_phones:
         raise ValueError("Blabber sequence is empty.")
 
     try:
-        output = render_blabber_sequence(audio, mutated_phones, use_source_speaker_wav)
+        normalized_voice_mode = normalize_blabber_voice_mode(voice_mode)
+        output, coqui_model_name = render_blabber_sequence(audio, mutated_phones, normalized_voice_mode)
     except CoquiSynthesisError as exc:
         raise RuntimeError(f"Coqui synthesis failed in conda env '{COQUI_ENV_NAME}'.\n\n{exc}") from exc
 
@@ -950,7 +947,9 @@ def render_blabber_from_resolved_phones(
             sum(1 for src, dst in zip(source_phones, mutated_phones[: len(source_phones)]) if src != dst)
             + max(0, len(mutated_phones) - len(source_phones))
         ),
-        "source_speaker_wav": "1" if use_source_speaker_wav else "0",
+        "voice_mode": normalized_voice_mode,
+        "coqui_model_name": coqui_model_name,
+        "source_speaker_wav": "1" if normalized_voice_mode == "source_clone" else "0",
     }
     if quality is not None:
         metadata["quality"] = f"{quality:.3f}"
@@ -975,6 +974,9 @@ def render_blabber_from_resolved_phones(
         metadata["per_phone_distance_total"] = f"{sum(float(value) for value in per_phone_distances):.6f}"
     if per_phone_sequences is not None:
         metadata["per_phone_sequences"] = ";".join("-".join(sequence) for sequence in per_phone_sequences)
+    if per_phone_numeric_entries_used is not None:
+        metadata["per_phone_numeric_entries_used"] = "1" if per_phone_numeric_entries_used else "0"
+        metadata["per_phone_reference_warning"] = "0" if per_phone_numeric_entries_used else "1"
     if quality is not None and phoneme_qualities is None:
         natural_duration_sec = float(output.shape[0]) / float(audio.sample_rate_hz)
         metadata["natural_duration_sec"] = f"{natural_duration_sec:.4f}"
@@ -1043,7 +1045,7 @@ def render_blabber(
     transcript: str,
     quality: float,
     phoneme_qualities: Sequence[float] | None = None,
-    use_source_speaker_wav: bool = False,
+    voice_mode: str = "woman",
 ) -> AudioBuffer:
     ensure_coqui_backend(COQUI_ENV_NAME)
     (
@@ -1056,6 +1058,7 @@ def render_blabber(
         per_phone_preset_indices,
         per_phone_distances,
         per_phone_sequences,
+        per_phone_numeric_entries_used,
     ) = resolve_blabber_phone_sequence(
         transcript,
         quality,
@@ -1066,7 +1069,7 @@ def render_blabber(
         cleaned,
         source_phones,
         substituted_phones,
-        use_source_speaker_wav=use_source_speaker_wav,
+        voice_mode=voice_mode,
         quality=quality,
         global_preset_index=preset_index,
         expansion_used=expansion_used,
@@ -1074,6 +1077,7 @@ def render_blabber(
         per_phone_preset_indices=per_phone_preset_indices,
         per_phone_distances=per_phone_distances,
         per_phone_sequences=per_phone_sequences,
+        per_phone_numeric_entries_used=per_phone_numeric_entries_used,
     )
 
 
@@ -1081,7 +1085,7 @@ def render_blabber_per_phoneme(
     audio: AudioBuffer,
     transcript: str,
     phoneme_qualities: Sequence[float],
-    use_source_speaker_wav: bool = False,
+    voice_mode: str = "woman",
 ) -> AudioBuffer:
     ensure_coqui_backend(COQUI_ENV_NAME)
     (
@@ -1094,6 +1098,7 @@ def render_blabber_per_phoneme(
         per_phone_preset_indices,
         per_phone_distances,
         per_phone_sequences,
+        per_phone_numeric_entries_used,
     ) = resolve_blabber_phone_sequence(
         transcript,
         quality=1.0,
@@ -1104,12 +1109,13 @@ def render_blabber_per_phoneme(
         cleaned,
         source_phones,
         mutated_phones,
-        use_source_speaker_wav=use_source_speaker_wav,
+        voice_mode=voice_mode,
         phoneme_qualities=phoneme_qualities,
         segmentation="phonetic",
         per_phone_preset_indices=per_phone_preset_indices,
         per_phone_distances=per_phone_distances,
         per_phone_sequences=per_phone_sequences,
+        per_phone_numeric_entries_used=per_phone_numeric_entries_used,
     )
 
 
@@ -1119,14 +1125,14 @@ def render_blabber_with_segments(
     quality: float,
     breakpoints_str: str,
     phoneme_qualities: Sequence[float] | None = None,
-    use_source_speaker_wav: bool = False,
+    voice_mode: str = "woman",
 ) -> AudioBuffer:
     blabber = render_blabber(
         audio,
         transcript,
         quality,
         phoneme_qualities,
-        use_source_speaker_wav=use_source_speaker_wav,
+        voice_mode=voice_mode,
     )
     source_phones = blabber.metadata.get("source_phones", "").split("-") if blabber.metadata.get("source_phones") else []
     mutated_phones = (
@@ -1192,6 +1198,8 @@ class SpeechDistortionGui:
         self.root = root
         self.root.title("Speech Distortion GUI")
         self.root.geometry("760x1080")
+        self.scroll_canvas: tk.Canvas | None = None
+        self.scroll_container: ttk.Frame | None = None
 
         self.reader = WavAudioReader()
         self.writer = WavAudioWriter()
@@ -1209,7 +1217,7 @@ class SpeechDistortionGui:
         self.quality_var = tk.DoubleVar(value=0.75)
         self.transcript_var = tk.StringVar(value="yes")
         self.breakpoints_var = tk.StringVar(value="auto")
-        self.use_source_speaker_wav_var = tk.BooleanVar(value=False)
+        self.voice_mode_var = tk.StringVar(value="woman")
         self.status_var = tk.StringVar(value="Choose a WAV file and render an augmentation.")
         self.subtitle_var = tk.StringVar(value=subtitle_text_for_mode(self.mode_var.get()))
         self.slider_label_var = tk.StringVar(value=slider_caption_for_mode(self.mode_var.get()))
@@ -1219,13 +1227,30 @@ class SpeechDistortionGui:
         self.quality_var.trace_add("write", self._on_blabber_inputs_changed)
         self.mode_var.trace_add("write", self._on_mode_changed)
         self.quality_mode_var.trace_add("write", self._on_blabber_inputs_changed)
+        self.voice_mode_var.trace_add("write", self._on_blabber_inputs_changed)
         if self.audio_path_var.get():
             self._load_audio(Path(self.audio_path_var.get()))
         self._refresh_phoneme_controls()
 
     def _build_ui(self) -> None:
-        container = ttk.Frame(self.root, padding=16)
-        container.pack(fill=tk.BOTH, expand=True)
+        outer = ttk.Frame(self.root)
+        outer.pack(fill=tk.BOTH, expand=True)
+
+        self.scroll_canvas = tk.Canvas(outer, highlightthickness=0)
+        scrollbar = ttk.Scrollbar(outer, orient=tk.VERTICAL, command=self.scroll_canvas.yview)
+        self.scroll_canvas.configure(yscrollcommand=scrollbar.set)
+
+        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+        self.scroll_canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+
+        container = ttk.Frame(self.scroll_canvas, padding=16)
+        self.scroll_container = container
+        self.scroll_canvas_window = self.scroll_canvas.create_window((0, 0), window=container, anchor="nw")
+        container.bind("<Configure>", self._on_scrollable_frame_configure)
+        self.scroll_canvas.bind("<Configure>", self._on_scrollable_canvas_configure)
+        self.root.bind_all("<MouseWheel>", self._on_mousewheel)
+        self.root.bind_all("<Button-4>", self._on_mousewheel)
+        self.root.bind_all("<Button-5>", self._on_mousewheel)
 
         title = ttk.Label(
             container,
@@ -1285,15 +1310,16 @@ class SpeechDistortionGui:
         )
         self.phone_style_combo.pack(side=tk.LEFT, fill=tk.X, expand=True)
 
-        speaker_clone_row = ttk.Frame(container)
-        speaker_clone_row.pack(fill=tk.X, pady=(12, 0))
-        ttk.Label(speaker_clone_row, text="Voice clone", width=14).pack(side=tk.LEFT)
-        self.source_speaker_check = ttk.Checkbutton(
-            speaker_clone_row,
-            text="Use source WAV as speaker_wav",
-            variable=self.use_source_speaker_wav_var,
+        voice_row = ttk.Frame(container)
+        voice_row.pack(fill=tk.X, pady=(12, 0))
+        ttk.Label(voice_row, text="Voice", width=14).pack(side=tk.LEFT)
+        self.voice_mode_combo = ttk.Combobox(
+            voice_row,
+            textvariable=self.voice_mode_var,
+            values=BLABBER_VOICE_MODES,
+            state="readonly",
         )
-        self.source_speaker_check.pack(side=tk.LEFT)
+        self.voice_mode_combo.pack(side=tk.LEFT, fill=tk.X, expand=True)
 
         phoneme_frame = ttk.LabelFrame(container, text="Phoneme Quality", padding=12)
         phoneme_frame.pack(fill=tk.X, pady=(12, 0))
@@ -1353,6 +1379,35 @@ class SpeechDistortionGui:
         self._sync_quality_label()
         self._update_mode_state()
         self._update_quality_mode_state()
+
+    def _on_scrollable_frame_configure(self, _event: tk.Event[tk.Misc]) -> None:
+        if self.scroll_canvas is None or self.scroll_container is None:
+            return
+        self.scroll_canvas.configure(scrollregion=self.scroll_canvas.bbox("all"))
+
+    def _on_scrollable_canvas_configure(self, event: tk.Event[tk.Misc]) -> None:
+        if self.scroll_canvas is None:
+            return
+        self.scroll_canvas.itemconfigure(self.scroll_canvas_window, width=event.width)
+
+    def _should_scroll_main_canvas(self) -> bool:
+        if self.scroll_canvas is None:
+            return False
+        focus_widget = self.root.focus_get()
+        return not isinstance(focus_widget, tk.Text)
+
+    def _on_mousewheel(self, event: tk.Event[tk.Misc]) -> None:
+        if self.scroll_canvas is None or not self._should_scroll_main_canvas():
+            return
+        if getattr(event, "delta", 0):
+            units = -int(event.delta / 120)
+        elif getattr(event, "num", None) == 4:
+            units = -1
+        elif getattr(event, "num", None) == 5:
+            units = 1
+        else:
+            return
+        self.scroll_canvas.yview_scroll(units, "units")
 
     def _sync_quality_label(self, *_args: object) -> None:
         self.quality_label.configure(
@@ -1439,10 +1494,10 @@ class SpeechDistortionGui:
         else:
             self.phone_style_combo.state(["disabled"])
         if mode == "blabber":
-            self.source_speaker_check.state(["!disabled"])
+            self.voice_mode_combo.state(["!disabled", "readonly"])
             self.generate_sequence_button.state(["!disabled"])
         else:
-            self.source_speaker_check.state(["disabled"])
+            self.voice_mode_combo.state(["disabled"])
             self.generate_sequence_button.state(["disabled"])
 
     def _invalidate_blabber_sequence(self) -> None:
@@ -1472,6 +1527,7 @@ class SpeechDistortionGui:
             per_phone_preset_indices,
             per_phone_distances,
             per_phone_sequences,
+            per_phone_numeric_entries_used,
         ) = resolve_blabber_phone_sequence(
             transcript,
             quality,
@@ -1490,6 +1546,7 @@ class SpeechDistortionGui:
             "per_phone_preset_indices": per_phone_preset_indices,
             "per_phone_distances": per_phone_distances,
             "per_phone_sequences": per_phone_sequences,
+            "per_phone_numeric_entries_used": per_phone_numeric_entries_used,
         }
 
     def _get_cached_blabber_sequence(self) -> dict[str, object] | None:
@@ -1540,6 +1597,17 @@ class SpeechDistortionGui:
                     "Per-phone sequences: "
                     + ";".join("-".join(sequence) for sequence in sequence_payload["per_phone_sequences"])
                 )
+            if sequence_payload.get("per_phone_numeric_entries_used") is not None:
+                lines.append(
+                    "Reference entries: "
+                    + (
+                        "numeric candidate distances"
+                        if bool(sequence_payload["per_phone_numeric_entries_used"])
+                        else "legacy fallback ordering"
+                    )
+                )
+                if not bool(sequence_payload["per_phone_numeric_entries_used"]):
+                    lines.append("Reference warning: regenerate phoneme_distances.json for smoother per-phoneme ladders")
         else:
             lines.append(f"Quality: {float(sequence_payload['quality']):.2f}")
             if sequence_payload["global_preset_index"] is not None:
@@ -1605,6 +1673,7 @@ class SpeechDistortionGui:
         breakpoints = self.breakpoints_var.get()
         transcript = self.transcript_var.get()
         phoneme_qualities = [float(var.get()) for var in self.phoneme_quality_vars] if use_per_phoneme else None
+        voice_mode = normalize_blabber_voice_mode(self.voice_mode_var.get())
         try:
             if mode == "static_noise":
                 if use_per_phoneme:
@@ -1697,7 +1766,7 @@ class SpeechDistortionGui:
                         str(cached_sequence["transcript"]),
                         list(cached_sequence["source_phones"]),
                         list(cached_sequence["mutated_phones"]),
-                        use_source_speaker_wav=bool(self.use_source_speaker_wav_var.get()),
+                        voice_mode=voice_mode,
                         phoneme_qualities=phoneme_qualities or [],
                         segmentation="phonetic",
                         per_phone_preset_indices=(
@@ -1713,6 +1782,11 @@ class SpeechDistortionGui:
                         per_phone_sequences=(
                             [list(sequence) for sequence in cached_sequence["per_phone_sequences"]]
                             if cached_sequence.get("per_phone_sequences") is not None
+                            else None
+                        ),
+                        per_phone_numeric_entries_used=(
+                            bool(cached_sequence["per_phone_numeric_entries_used"])
+                            if cached_sequence.get("per_phone_numeric_entries_used") is not None
                             else None
                         ),
                     )
@@ -1735,7 +1809,7 @@ class SpeechDistortionGui:
                         str(cached_sequence["transcript"]),
                         list(cached_sequence["source_phones"]),
                         list(cached_sequence["mutated_phones"]),
-                        use_source_speaker_wav=bool(self.use_source_speaker_wav_var.get()),
+                        voice_mode=voice_mode,
                         quality=quality,
                         breakpoints=breakpoint_label,
                         segmentation="phonetic",
@@ -1769,11 +1843,9 @@ class SpeechDistortionGui:
         if "noise_type" in metadata:
             details.append(f"Noise: {metadata['noise_type']}")
         if mode == "blabber":
-            details.append(
-                "Voice clone: source speaker_wav"
-                if metadata.get("source_speaker_wav") == "1"
-                else "Voice clone: preset model voice"
-            )
+            details.append(f"Voice mode: {metadata.get('voice_mode', 'woman')}")
+            if metadata.get("coqui_model_name"):
+                details.append(f"Coqui model: {metadata['coqui_model_name']}")
         if "breakpoints" in metadata:
             details.append(f"Breakpoints: {metadata['breakpoints']}")
         if "transcript" in metadata:
@@ -1791,6 +1863,14 @@ class SpeechDistortionGui:
                 details.append(f"Per-phone presets: {metadata['per_phone_preset_indices']}")
             if metadata.get("per_phone_distances"):
                 details.append(f"Per-phone distances: {metadata['per_phone_distances']}")
+            if metadata.get("per_phone_numeric_entries_used") is not None:
+                details.append(
+                    "Reference entries: numeric candidate distances"
+                    if metadata.get("per_phone_numeric_entries_used") == "1"
+                    else "Reference entries: legacy fallback ordering"
+                )
+            if metadata.get("per_phone_reference_warning") == "1":
+                details.append("Reference warning: regenerate phoneme_distances.json for smoother per-phoneme ladders")
             if mode == "blabber" and self._get_cached_blabber_sequence() is not None:
                 details.append("Sequence source: cached")
         elif self.detected_phones:

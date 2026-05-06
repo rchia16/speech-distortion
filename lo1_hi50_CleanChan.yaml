@@ -1,0 +1,62 @@
+
+test_dataset_data_root: [
+  'C:/Users/IDBA/Downloads/UTS_EEG/Dataloader/Daniel/Day5/sess8.cdt',
+]
+test_dataset_split_method: no-split
+decode_time: 1.0
+feature_type: wave             
+format: cdt
+output_format: raw
+n_jobs: 16
+channel_info_path: ~
+manual_set_channel_order_path: C:/Users/IDBA/Downloads/UTS_EEG/Dataloader/curry9_128_channel_channel_spec.csv
+default_drop_channels: ['10','11', 'VEO', 'HEO', 'EKG', 'EMG', '84', '85', '110', '111', 'TRIGGER']
+relevant_events: ['52','53','56','57', '58', '59', '60', '61'] 
+relevant_events_to_words: {'51':'Her','52':'Yes','53':'No' ,'54':'Lift', '55': 'Rough','56': 'Go','57': 'Pain' ,'58': 'Help' ,'59' :'Stop' , '60':'Food', '61':'Bath'}
+scaling_factor: 1e-6
+preprocess_name: EpochBased_lo1_hi50
+preproc_epochs:
+  filter_method: fir
+  l_freq: 1
+  h_freq: 50
+  resample_fs: 250
+  fnum: ~
+  fspacing: ~
+  fspecial: ~
+  resample_freq_time: ~
+  tmin: -1.0
+  tmax: 2.0 
+  avg_ref: True
+  notch_filter: True 
+  notch_freqs: [50]
+  baseline_tmin: -1.0
+  baseline_tmax: 0  
+  reject_epochs: True
+  reject_epochs_method: gfp_zscore
+  gfp_z_thresh: 4
+
+preproc_raw:
+  filter_method: fir
+  l_freq: 1
+  h_freq: 50
+  original_fs: 1000 # This is to replace the sampling rage input parameter in the dataset class
+  resample_fs: 250  
+  drop_channels: ['10','11', 'VEO', 'HEO', 'EKG', 'EMG', '84', '85', '110', '111', 'TRIGGER']
+  avg_ref: False
+  notch_filter: True
+  notch_freqs: [50]
+  apply_ica: False
+  ica_n_components: 'n-1'
+  ica_method: 'picard'
+  ica_random_state: 42
+  ica_threshhold: 0.9
+  clean_channels: True
+  clean_lo_std: 0.2
+  clean_hi_std: 7
+  clean_win_sec: 5.0
+  clean_step: 2.5
+  n_jobs: 16
+  debug: False
+
+enable_dataset_cache: True
+dataset_cache_root: C:/Users/IDBA/Downloads/UTS_EEG/Dataloader/dataset_cache/Day5

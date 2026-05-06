@@ -64,6 +64,28 @@ def load_phone_distance_candidate_entries(reference_path: str | None = None) -> 
 
 
 @lru_cache(maxsize=4)
+def load_phone_distance_entry_modes(reference_path: str | None = None) -> dict[str, str]:
+    modes: dict[str, str] = {}
+    payload = _load_reference_payload(reference_path)
+    if not isinstance(payload, list):
+        return modes
+
+    for item in payload:
+        if not isinstance(item, dict):
+            continue
+        phone = item.get("phone")
+        if not isinstance(phone, str):
+            continue
+        if isinstance(item.get("ranked_candidate_entries_near_to_far"), list):
+            modes[phone] = "numeric_entries"
+        elif isinstance(item.get("ranked_candidates_near_to_far"), list):
+            modes[phone] = "legacy_candidates"
+        elif isinstance(item.get("ranked_neighbors_near_to_far"), list):
+            modes[phone] = "legacy_neighbors"
+    return modes
+
+
+@lru_cache(maxsize=4)
 def load_phone_distance_candidates(reference_path: str | None = None) -> dict[str, list[list[str]]]:
     return {
         phone: [list(entry["phones"]) for entry in entries]
@@ -175,6 +197,20 @@ def ranked_candidates_from_reference(
     reference_path: str | None = None,
 ) -> list[list[str]]:
     return [list(entry["phones"]) for entry in ranked_candidate_entries_from_reference(phone, reference_path)]
+
+
+def phone_distance_entry_mode(
+    phone: str,
+    reference_path: str | None = None,
+) -> str:
+    return load_phone_distance_entry_modes(reference_path).get(phone, "fallback_choices")
+
+
+def phone_has_numeric_candidate_entries(
+    phone: str,
+    reference_path: str | None = None,
+) -> bool:
+    return phone_distance_entry_mode(phone, reference_path) == "numeric_entries"
 
 
 def ranked_single_candidates_from_reference(
@@ -394,13 +430,15 @@ def resolve_per_phoneme_blabber_sequences(
     fallback_map: Mapping[str, Sequence[str]] | None = None,
     reference_path: str | None = None,
     preset_count: int = PER_PHONEME_BLABBER_PRESET_COUNT,
-) -> tuple[list[list[str]], list[int], list[float], float, bool]:
+) -> tuple[list[list[str]], list[int], list[float], float, bool, bool]:
     fallback_map = fallback_map or {}
     candidate_sequences: list[list[str]] = []
     preset_indices: list[int] = []
     distances: list[float] = []
+    numeric_entries_used = True
     for index, phone in enumerate(source_phones):
         local_quality = float(phoneme_qualities[index]) if index < len(phoneme_qualities) else 1.0
+        numeric_entries_used = numeric_entries_used and phone_has_numeric_candidate_entries(phone, reference_path)
         sequence, preset_index, distance = resolve_phone_blabber_sequence(
             phone,
             local_quality,
@@ -413,7 +451,7 @@ def resolve_per_phoneme_blabber_sequences(
         distances.append(distance)
     total_distance = float(sum(distances))
     expansion_used = any(len(sequence) > 1 for sequence in candidate_sequences)
-    return candidate_sequences, preset_indices, distances, total_distance, expansion_used
+    return candidate_sequences, preset_indices, distances, total_distance, expansion_used, numeric_entries_used
 
 
 def build_global_blabber_ladder(

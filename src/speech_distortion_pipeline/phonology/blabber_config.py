@@ -1,18 +1,88 @@
 from __future__ import annotations
 
 import os
-from typing import Final
+from dataclasses import dataclass
+from typing import Final, Literal
 
 
 DEFAULT_GUI_INPUT_FILENAME: Final[str] = "yes_slow.wav"
 
 COQUI_ENV_NAME: Final[str] = os.environ.get("BLABBER_CONDA_ENV", "coqui-blabber")
-COQUI_MODEL_NAME: Final[str] = os.environ.get(
-    "BLABBER_COQUI_MODEL", "tts_models/en/ljspeech/tacotron2-DDC_ph"
+COQUI_WOMAN_MODEL_NAME: Final[str] = os.environ.get(
+    "BLABBER_COQUI_WOMAN_MODEL",
+    os.environ.get("BLABBER_COQUI_MODEL", "tts_models/en/ljspeech/tacotron2-DDC_ph"),
 )
+COQUI_MODEL_NAME: Final[str] = COQUI_WOMAN_MODEL_NAME
+COQUI_MAN_MODEL_NAME: Final[str] = os.environ.get("BLABBER_COQUI_MAN_MODEL", "").strip()
 COQUI_CLONE_MODEL_NAME: Final[str] = os.environ.get(
     "BLABBER_COQUI_CLONE_MODEL", "tts_models/multilingual/multi-dataset/xtts_v2"
 )
+BLABBER_VOICE_WOMAN: Final[str] = "woman"
+BLABBER_VOICE_MAN: Final[str] = "man"
+BLABBER_VOICE_SOURCE_CLONE: Final[str] = "source_clone"
+BLABBER_VOICE_MODES: Final[tuple[str, str, str]] = (
+    BLABBER_VOICE_WOMAN,
+    BLABBER_VOICE_MAN,
+    BLABBER_VOICE_SOURCE_CLONE,
+)
+BlabberVoiceMode = Literal["woman", "man", "source_clone"]
+
+
+@dataclass(frozen=True)
+class BlabberVoiceProfile:
+    voice_mode: BlabberVoiceMode
+    model_name: str
+    uses_source_speaker_wav: bool
+    prephonemized: bool
+    language: str | None
+    input_encoding: Literal["ipa", "clone_text"]
+
+
+def normalize_blabber_voice_mode(value: str) -> BlabberVoiceMode:
+    normalized = str(value).strip().lower()
+    if normalized not in BLABBER_VOICE_MODES:
+        raise ValueError(
+            f"Unsupported blabber voice mode '{value}'. Expected one of: {', '.join(BLABBER_VOICE_MODES)}."
+        )
+    return normalized  # type: ignore[return-value]
+
+
+def resolve_blabber_voice_profile(voice_mode: str) -> BlabberVoiceProfile:
+    normalized = normalize_blabber_voice_mode(voice_mode)
+    if normalized == BLABBER_VOICE_SOURCE_CLONE:
+        return BlabberVoiceProfile(
+            voice_mode=normalized,
+            model_name=COQUI_CLONE_MODEL_NAME,
+            uses_source_speaker_wav=True,
+            prephonemized=False,
+            language="en",
+            input_encoding="clone_text",
+        )
+    if normalized == BLABBER_VOICE_MAN:
+        if not COQUI_MAN_MODEL_NAME:
+            raise ValueError(
+                "BLABBER_COQUI_MAN_MODEL is not set. Configure a male preset Coqui model before using voice mode 'man'."
+            )
+        return BlabberVoiceProfile(
+            voice_mode=normalized,
+            model_name=COQUI_MAN_MODEL_NAME,
+            uses_source_speaker_wav=False,
+            prephonemized=True,
+            language=None,
+            input_encoding="ipa",
+        )
+    if not COQUI_WOMAN_MODEL_NAME:
+        raise ValueError(
+            "BLABBER_COQUI_WOMAN_MODEL is not set. Configure a female preset Coqui model before using voice mode 'woman'."
+        )
+    return BlabberVoiceProfile(
+        voice_mode=normalized,
+        model_name=COQUI_WOMAN_MODEL_NAME,
+        uses_source_speaker_wav=False,
+        prephonemized=True,
+        language=None,
+        input_encoding="ipa",
+    )
 
 PHONE_SUBSTITUTIONS: Final[dict[str, tuple[str, ...]]] = {
     "R": ("W", "L"),
