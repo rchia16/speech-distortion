@@ -5,7 +5,9 @@ from dataclasses import dataclass
 from typing import Final, Literal
 
 
-DEFAULT_GUI_INPUT_FILENAME: Final[str] = "yes_slow.wav"
+DEFAULT_GUI_INPUT_FILENAME: Final[str] = "D:/Ray/OneDrive - UTS/Projects/"\
+        "eeg2text/Assets/en.text-to-speech.online/aus-en_woman/"\
+        "aus-en_woman_bath_trim.wav"
 
 COQUI_ENV_NAME: Final[str] = os.environ.get("BLABBER_CONDA_ENV", "coqui-blabber")
 COQUI_WOMAN_MODEL_NAME: Final[str] = os.environ.get(

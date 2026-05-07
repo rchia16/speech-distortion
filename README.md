@@ -94,9 +94,11 @@ The default demo input is `yes_slow.wav` when present in the repo root.
 
 - global mode uses a deterministic per-word distance ladder built from `phoneme_distances.json`
 - each quality value maps to a preset index, and each preset index resolves to the next distinct word-level substitution state by cumulative distance
+- the global max phoneme distance control sets the quality-0 word-distance endpoint; global quality gradations are rescaled from total distance 0 to that max, while individual candidates above the max are excluded
 - rendered metadata includes:
   - `global_preset_index`
   - `global_distance_total`
+  - `global_max_phoneme_distance`
   - `expansion_used`
 
 #### Per-Phoneme Blabber
@@ -126,6 +128,7 @@ The default demo input is `yes_slow.wav` when present in the repo root.
 `build_blabber_library.py` generates standalone Blabber assets from a manifest of input WAVs and single-word transcripts.
 The builder currently renders only the female/woman preset voice. A later male voice path is expected to be
 implemented as a post-process style-transfer stage on the generated audio, not as a second direct TTS render mode.
+For `global_soft` generation, `--global-max-phoneme-distance` applies the same per-phone distance cap as the GUI.
 
 Supported manifest formats:
 

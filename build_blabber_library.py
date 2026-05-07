@@ -292,6 +292,7 @@ def build_per_phoneme_blabber_sequence(
 def resolve_global_blabber_phone_sequence(
     transcript: str,
     quality: float,
+    max_phoneme_distance: float | None = None,
 ) -> tuple[str, list[str], list[str], int, bool, float]:
     cleaned = transcript.strip()
     if not cleaned:
@@ -308,6 +309,7 @@ def resolve_global_blabber_phone_sequence(
         source_phones,
         quality,
         fallback_map=PHONE_SUBSTITUTIONS,
+        max_phoneme_distance=max_phoneme_distance,
     )
     mutated_phones = [phone for sequence in candidate_sequences for phone in sequence]
     return cleaned, source_phones, mutated_phones, preset_index, expansion_used, total_distance
@@ -449,35 +451,38 @@ def render_blabber_global(
     audio: AudioBuffer,
     transcript: str,
     quality: float,
+    max_phoneme_distance: float | None = None,
 ) -> tuple[AudioBuffer, list[str], list[str], int, bool, float]:
     cleaned, source_phones, mutated_phones, preset_index, expansion_used, total_distance = resolve_global_blabber_phone_sequence(
         transcript,
         quality,
+        max_phoneme_distance=max_phoneme_distance,
     )
     try:
         output, coqui_model_name = render_blabber_sequence(audio, mutated_phones, LIBRARY_BLABBER_VOICE_MODE)
     except CoquiSynthesisError as exc:
         raise RuntimeError(f"Coqui synthesis failed in conda env '{COQUI_ENV_NAME}'.\n\n{exc}") from exc
-    rendered_audio = from_numpy(
-        output,
-        audio,
-        augmentation="blabber",
-        quality=f"{quality:.3f}",
-        transcript=cleaned,
-        source_phones="-".join(source_phones),
-        substituted_phones="-".join(mutated_phones),
-        substituted_ipa=phones_to_ipa(mutated_phones),
-        global_preset_index=str(preset_index),
-        expansion_used="1" if expansion_used else "0",
-        global_distance_total=f"{total_distance:.6f}",
-        voice_mode=LIBRARY_BLABBER_VOICE_MODE,
-        coqui_model_name=coqui_model_name,
-        source_speaker_wav="0",
-        global_progression_policy="deterministic_distance_ladder",
-        style_transfer_backend="none",
-        style_transfer_target_voice="",
-        style_transfer_status="not_requested",
-    )
+    metadata = {
+        "augmentation": "blabber",
+        "quality": f"{quality:.3f}",
+        "transcript": cleaned,
+        "source_phones": "-".join(source_phones),
+        "substituted_phones": "-".join(mutated_phones),
+        "substituted_ipa": phones_to_ipa(mutated_phones),
+        "global_preset_index": str(preset_index),
+        "expansion_used": "1" if expansion_used else "0",
+        "global_distance_total": f"{total_distance:.6f}",
+        "voice_mode": LIBRARY_BLABBER_VOICE_MODE,
+        "coqui_model_name": coqui_model_name,
+        "source_speaker_wav": "0",
+        "global_progression_policy": "deterministic_distance_ladder",
+        "style_transfer_backend": "none",
+        "style_transfer_target_voice": "",
+        "style_transfer_status": "not_requested",
+    }
+    if max_phoneme_distance is not None:
+        metadata["global_max_phoneme_distance"] = f"{max_phoneme_distance:.3f}"
+    rendered_audio = from_numpy(output, audio, **metadata)
     return rendered_audio, source_phones, mutated_phones, preset_index, expansion_used, total_distance
 
 
@@ -636,6 +641,7 @@ def process_entry(
     reader: WavAudioReader,
     writer: WavAudioWriter,
     generation_mode: str,
+    global_max_phoneme_distance: float | None = None,
 ) -> dict[str, Any]:
     if not entry.audio_path.exists():
         raise FileNotFoundError(f"Input audio file does not exist: {entry.audio_path}")
@@ -663,6 +669,7 @@ def process_entry(
                 audio,
                 entry.transcript,
                 quality,
+                max_phoneme_distance=global_max_phoneme_distance,
             )
 
             output_audio_path = output_dir / (
@@ -700,6 +707,7 @@ def process_entry(
                     "global_preset_index": resolved_preset_index,
                     "expansion_used": expansion_used,
                     "global_distance_total": total_distance,
+                    "global_max_phoneme_distance": global_max_phoneme_distance,
                 }
             )
     else:
@@ -780,6 +788,15 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default="global_soft",
         help="Generate softened global blabber presets or the original per-phoneme permutations.",
     )
+    parser.add_argument(
+        "--global-max-phoneme-distance",
+        type=float,
+        default=None,
+        help=(
+            "Optional quality-0 word-distance endpoint for global_soft generation. "
+            "Individual candidates above this distance are excluded."
+        ),
+    )
     return parser
 
 
@@ -806,6 +823,11 @@ def main() -> int:
             reader,
             writer,
             str(args.generation_mode),
+            global_max_phoneme_distance=(
+                max(0.0, float(args.global_max_phoneme_distance))
+                if args.global_max_phoneme_distance is not None
+                else None
+            ),
         )
         for entry in entries
     ]

@@ -11,6 +11,7 @@ REPO_ROOT = Path(__file__).resolve().parents[3]
 DEFAULT_REFERENCE_PATH = REPO_ROOT / "phoneme_distances.json"
 GLOBAL_BLABBER_PRESET_COUNT = 20
 PER_PHONEME_BLABBER_PRESET_COUNT = 20
+GLOBAL_BLABBER_SCALED_LADDER_BEAM_WIDTH = 12
 
 
 def _candidate_entry(
@@ -308,14 +309,21 @@ def _effective_candidate_entries_pool(
     phone: str,
     fallback_choices: Sequence[str] = (),
     reference_path: str | None = None,
+    max_phoneme_distance: float | None = None,
 ) -> list[dict[str, Any]]:
     ranked = ranked_candidate_entries_from_reference(phone, reference_path)
     if ranked:
-        return _dedupe_candidate_entries(ranked)
-    return [
-        _candidate_entry([choice], float(index + 1), index)
-        for index, choice in enumerate(_dedupe_preserve_order(fallback_choices))
-    ]
+        entries = _dedupe_candidate_entries(ranked)
+    else:
+        entries = [
+            _candidate_entry([choice], float(index + 1), index)
+            for index, choice in enumerate(_dedupe_preserve_order(fallback_choices))
+        ]
+
+    if max_phoneme_distance is None:
+        return entries
+    capped_distance = max(0.0, float(max_phoneme_distance))
+    return [entry for entry in entries if float(entry["distance"]) <= capped_distance]
 
 
 def _effective_candidate_pool(
@@ -348,9 +356,17 @@ def _global_options_for_phone(
     phone: str,
     fallback_choices: Sequence[str] = (),
     reference_path: str | None = None,
+    max_phoneme_distance: float | None = None,
 ) -> list[dict[str, Any]]:
     options = [_base_global_option(phone)]
-    options.extend(_effective_candidate_entries_pool(phone, fallback_choices, reference_path))
+    options.extend(
+        _effective_candidate_entries_pool(
+            phone,
+            fallback_choices,
+            reference_path,
+            max_phoneme_distance=max_phoneme_distance,
+        )
+    )
     return _dedupe_candidate_entries(options)
 
 
@@ -362,6 +378,101 @@ def _global_state_key(
     expansion_count = sum(max(0, len(options_by_phone[pos][choice]["phones"]) - 1) for pos, choice in enumerate(indices))
     mutation_count = sum(1 for choice in indices if choice > 0)
     return (total_distance, expansion_count, mutation_count, indices)
+
+
+def _global_ladder_entry_from_indices(
+    indices: tuple[int, ...],
+    options_by_phone: Sequence[Sequence[Mapping[str, Any]]],
+    preset_index: int,
+) -> dict[str, Any]:
+    sequences = [list(options_by_phone[pos][choice]["phones"]) for pos, choice in enumerate(indices)]
+    mutated = [phone for sequence in sequences for phone in sequence]
+    total_distance = sum(float(options_by_phone[pos][choice]["distance"]) for pos, choice in enumerate(indices))
+    return {
+        "candidate_sequences": sequences,
+        "mutated_phones": mutated,
+        "total_distance": float(total_distance),
+        "preset_index": int(preset_index),
+        "expansion_used": any(len(sequence) > 1 for sequence in sequences),
+    }
+
+
+def _scaled_distance_targets(max_distance: float, preset_count: int) -> list[float]:
+    target_count = max(1, int(preset_count))
+    if target_count <= 1:
+        return [0.0]
+    return [
+        float(max_distance) * (slot / float(target_count - 1))
+        for slot in range(target_count)
+    ]
+
+
+def _state_target_sort_key(
+    state: tuple[float, int, int, tuple[int, ...]],
+    target_distance: float,
+) -> tuple[float, bool, int, int, tuple[int, ...]]:
+    total_distance, expansion_count, mutation_count, indices = state
+    return (
+        abs(total_distance - target_distance),
+        total_distance > target_distance,
+        expansion_count,
+        mutation_count,
+        indices,
+    )
+
+
+def _prune_index_states_to_targets(
+    states: Sequence[tuple[float, int, int, tuple[int, ...]]],
+    targets: Sequence[float],
+    beam_width: int = GLOBAL_BLABBER_SCALED_LADDER_BEAM_WIDTH,
+) -> list[tuple[float, int, int, tuple[int, ...]]]:
+    selected: dict[tuple[int, ...], tuple[float, int, int, tuple[int, ...]]] = {}
+    width = max(1, int(beam_width))
+    for target in targets:
+        ranked = sorted(states, key=lambda state, target=target: _state_target_sort_key(state, target))
+        for state in ranked[:width]:
+            selected[state[3]] = state
+    return sorted(selected.values(), key=lambda state: (state[0], state[1], state[2], state[3]))
+
+
+def _build_scaled_global_index_states(
+    options_by_phone: Sequence[Sequence[Mapping[str, Any]]],
+    preset_count: int,
+    max_distance: float,
+) -> list[tuple[float, int, int, tuple[int, ...]]]:
+    target_count = max(1, int(preset_count))
+    partial_states: list[tuple[float, int, int, tuple[int, ...]]] = [(0.0, 0, 0, tuple())]
+    target_max_distance = max(0.0, float(max_distance))
+
+    for options in options_by_phone:
+        if not options:
+            continue
+        expanded_states: list[tuple[float, int, int, tuple[int, ...]]] = []
+        for total_distance, expansion_count, mutation_count, indices in partial_states:
+            for choice, option in enumerate(options):
+                sequence = list(option["phones"])
+                next_total_distance = total_distance + float(option["distance"])
+                if next_total_distance > target_max_distance:
+                    continue
+                expanded_states.append(
+                    (
+                        next_total_distance,
+                        expansion_count + max(0, len(sequence) - 1),
+                        mutation_count + (1 if choice > 0 else 0),
+                        indices + (choice,),
+                    )
+                )
+        partial_targets = _scaled_distance_targets(target_max_distance, target_count)
+        partial_states = _prune_index_states_to_targets(expanded_states, partial_targets)
+
+    if not partial_states:
+        return [(0.0, 0, 0, tuple(0 for _ in options_by_phone))]
+
+    final_targets = _scaled_distance_targets(target_max_distance, target_count)
+    return [
+        min(partial_states, key=lambda state, target=target: _state_target_sort_key(state, target))
+        for target in final_targets
+    ]
 
 
 def _sample_sorted_states(
@@ -451,7 +562,8 @@ def resolve_per_phoneme_blabber_sequences(
         distances.append(distance)
     total_distance = float(sum(distances))
     expansion_used = any(len(sequence) > 1 for sequence in candidate_sequences)
-    return candidate_sequences, preset_indices, distances, total_distance, expansion_used, numeric_entries_used
+    return candidate_sequences, preset_indices, distances, total_distance, \
+            expansion_used, numeric_entries_used
 
 
 def build_global_blabber_ladder(
@@ -459,15 +571,32 @@ def build_global_blabber_ladder(
     fallback_map: Mapping[str, Sequence[str]] | None = None,
     reference_path: str | None = None,
     preset_count: int = GLOBAL_BLABBER_PRESET_COUNT,
+    max_phoneme_distance: float | None = None,
 ) -> list[dict[str, Any]]:
     if not source_phones:
         return []
 
     fallback_map = fallback_map or {}
     options_by_phone = [
-        _global_options_for_phone(phone, fallback_map.get(phone, ()), reference_path)
+        _global_options_for_phone(
+            phone,
+            fallback_map.get(phone, ()),
+            reference_path,
+            max_phoneme_distance=max_phoneme_distance,
+        )
         for phone in source_phones
     ]
+    if max_phoneme_distance is not None:
+        scaled_states = _build_scaled_global_index_states(
+            options_by_phone,
+            preset_count,
+            max_phoneme_distance,
+        )
+        return [
+            _global_ladder_entry_from_indices(state[3], options_by_phone, preset_index)
+            for preset_index, state in enumerate(scaled_states)
+        ]
+
     start_indices = tuple(0 for _ in source_phones)
     heap: list[tuple[tuple[float, int, int, tuple[int, ...]], tuple[int, ...]]] = [
         (_global_state_key(start_indices, options_by_phone), start_indices)
@@ -479,20 +608,11 @@ def build_global_blabber_ladder(
 
     while heap and len(ladder) < max_states:
         _key, indices = heapq.heappop(heap)
-        sequences = [list(options_by_phone[pos][choice]["phones"]) for pos, choice in enumerate(indices)]
-        mutated = tuple(phone for sequence in sequences for phone in sequence)
+        entry = _global_ladder_entry_from_indices(indices, options_by_phone, len(ladder))
+        mutated = tuple(entry["mutated_phones"])
         if mutated not in seen_mutated_sequences:
             seen_mutated_sequences.add(mutated)
-            total_distance = sum(float(options_by_phone[pos][choice]["distance"]) for pos, choice in enumerate(indices))
-            ladder.append(
-                {
-                    "candidate_sequences": sequences,
-                    "mutated_phones": list(mutated),
-                    "total_distance": float(total_distance),
-                    "preset_index": len(ladder),
-                    "expansion_used": any(len(sequence) > 1 for sequence in sequences),
-                }
-            )
+            ladder.append(entry)
 
         for position in range(len(indices)):
             next_choice = indices[position] + 1
@@ -538,6 +658,7 @@ def resolve_global_blabber_sequences(
     fallback_map: Mapping[str, Sequence[str]] | None = None,
     reference_path: str | None = None,
     preset_count: int = GLOBAL_BLABBER_PRESET_COUNT,
+    max_phoneme_distance: float | None = None,
 ) -> tuple[list[list[str]], int, bool, float]:
     preset_index = global_blabber_preset_index(quality, preset_count=preset_count)
     if not source_phones:
@@ -547,6 +668,7 @@ def resolve_global_blabber_sequences(
         fallback_map=fallback_map,
         reference_path=reference_path,
         preset_count=preset_count,
+        max_phoneme_distance=max_phoneme_distance,
     )
     selected = ladder[min(len(ladder) - 1, preset_index)]
     return (
@@ -563,6 +685,7 @@ def resolve_soft_global_blabber_sequences(
     fallback_map: Mapping[str, Sequence[str]] | None = None,
     reference_path: str | None = None,
     preset_count: int = GLOBAL_BLABBER_PRESET_COUNT,
+    max_phoneme_distance: float | None = None,
 ) -> tuple[list[list[str]], int, bool, float]:
     return resolve_global_blabber_sequences(
         source_phones,
@@ -570,6 +693,7 @@ def resolve_soft_global_blabber_sequences(
         fallback_map=fallback_map,
         reference_path=reference_path,
         preset_count=preset_count,
+        max_phoneme_distance=max_phoneme_distance,
     )
 
 

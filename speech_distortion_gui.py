@@ -1,16 +1,6 @@
 """
-  - Define the first grades so they only use top 3 neighbors. Recommended fixed ladder:
-      - Grade 0: [src]
-      - Grade 1: [n1]
-      - Grade 2: [n2]
-      - Grade 3: [n2, n1]
-      - Grade 4: [n3]
-      - Grade 5: [n3, n1]
-      - Grade 6: [n3, n2]
-      - Grade 7: [n3, n2, n1]
-      - Grade 8: first use of n4, e.g. [n4]
-      - Grade 9: stronger n4 pattern, e.g. [n4, n3]
-      - Grade 10: strongest allowed pattern, e.g. [n4, n3, n2]
+Phoneme distances are based on candidates and assessed according to the
+granularity set in src/speech_distortion_pipeline/phonology/
 """
 from __future__ import annotations
 
@@ -65,6 +55,8 @@ from speech_distortion_pipeline.resynthesis.fragment_synthesizer import (
 DEFAULT_INPUT = ROOT / DEFAULT_GUI_INPUT_FILENAME
 MAX_DROPOUT_FRACTION = 0.8
 MAX_DROPOUT_SILENCE_MS = 200.0
+GLOBAL_BLABBER_MAX_PHONEME_DISTANCE_VALUES = tuple(f"{value / 10.0:.1f}" for value in range(8, 101))
+DEFAULT_GLOBAL_BLABBER_MAX_PHONEME_DISTANCE = "4.0"
 
 
 PHONE_CLASS_WEIGHTS: dict[str, float] = {
@@ -827,19 +819,23 @@ def build_per_phoneme_blabber_sequence(
     source_phones: Sequence[str],
     phoneme_qualities: Sequence[float],
 ) -> tuple[list[str], list[int], list[float], float, bool, list[list[str]], bool]:
-    candidate_sequences, preset_indices, distances, total_distance, expansion_used, numeric_entries_used = resolve_per_phoneme_blabber_sequences(
-        source_phones,
-        [clamp_unit(float(value)) for value in phoneme_qualities],
-        fallback_map=PHONE_SUBSTITUTIONS,
-    )
+    candidate_sequences, preset_indices, distances, total_distance, \
+            expansion_used, numeric_entries_used = \
+            resolve_per_phoneme_blabber_sequences(
+                source_phones,
+                [clamp_unit(float(value)) for value in phoneme_qualities],
+                fallback_map=PHONE_SUBSTITUTIONS,
+            )
     mutated = [phone for sequence in candidate_sequences for phone in sequence]
-    return mutated, preset_indices, distances, total_distance, expansion_used, candidate_sequences, numeric_entries_used
+    return mutated, preset_indices, distances, total_distance, \
+            expansion_used, candidate_sequences, numeric_entries_used
 
 
 def resolve_blabber_phone_sequence(
     transcript: str,
     quality: float,
     phoneme_qualities: Sequence[float] | None = None,
+    max_phoneme_distance: float | None = None,
 ) -> tuple[
     str,
     list[str],
@@ -890,6 +886,7 @@ def resolve_blabber_phone_sequence(
                 source_phones,
                 quality,
                 fallback_map=PHONE_SUBSTITUTIONS,
+                max_phoneme_distance=max_phoneme_distance,
             )
             mutated_phones = [phone for sequence in candidate_sequences for phone in sequence]
             per_phone_preset_indices = None
@@ -923,6 +920,7 @@ def render_blabber_from_resolved_phones(
     global_preset_index: int | None = None,
     expansion_used: bool | None = None,
     global_distance_total: float | None = None,
+    global_max_phoneme_distance: float | None = None,
     per_phone_preset_indices: Sequence[int] | None = None,
     per_phone_distances: Sequence[float] | None = None,
     per_phone_sequences: Sequence[Sequence[str]] | None = None,
@@ -967,6 +965,8 @@ def render_blabber_from_resolved_phones(
         metadata["expansion_used"] = "1" if expansion_used else "0"
     if global_distance_total is not None:
         metadata["global_distance_total"] = f"{global_distance_total:.6f}"
+    if global_max_phoneme_distance is not None:
+        metadata["global_max_phoneme_distance"] = f"{global_max_phoneme_distance:.3f}"
     if per_phone_preset_indices is not None:
         metadata["per_phone_preset_indices"] = ",".join(str(int(value)) for value in per_phone_preset_indices)
     if per_phone_distances is not None:
@@ -1046,6 +1046,7 @@ def render_blabber(
     quality: float,
     phoneme_qualities: Sequence[float] | None = None,
     voice_mode: str = "woman",
+    max_phoneme_distance: float | None = None,
 ) -> AudioBuffer:
     ensure_coqui_backend(COQUI_ENV_NAME)
     (
@@ -1063,6 +1064,7 @@ def render_blabber(
         transcript,
         quality,
         phoneme_qualities,
+        max_phoneme_distance=max_phoneme_distance,
     )
     return render_blabber_from_resolved_phones(
         audio,
@@ -1074,6 +1076,7 @@ def render_blabber(
         global_preset_index=preset_index,
         expansion_used=expansion_used,
         global_distance_total=total_distance,
+        global_max_phoneme_distance=max_phoneme_distance if phoneme_qualities is None else None,
         per_phone_preset_indices=per_phone_preset_indices,
         per_phone_distances=per_phone_distances,
         per_phone_sequences=per_phone_sequences,
@@ -1126,6 +1129,7 @@ def render_blabber_with_segments(
     breakpoints_str: str,
     phoneme_qualities: Sequence[float] | None = None,
     voice_mode: str = "woman",
+    max_phoneme_distance: float | None = None,
 ) -> AudioBuffer:
     blabber = render_blabber(
         audio,
@@ -1133,6 +1137,7 @@ def render_blabber_with_segments(
         quality,
         phoneme_qualities,
         voice_mode=voice_mode,
+        max_phoneme_distance=max_phoneme_distance,
     )
     source_phones = blabber.metadata.get("source_phones", "").split("-") if blabber.metadata.get("source_phones") else []
     mutated_phones = (
@@ -1209,13 +1214,15 @@ class SpeechDistortionGui:
         self.phoneme_quality_vars: list[tk.DoubleVar] = []
         self.detected_phones: list[str] = []
         self.cached_blabber_sequence: dict[str, object] | None = None
+        self.live_blabber_sequence_after_id: str | None = None
 
         self.audio_path_var = tk.StringVar(value=str(DEFAULT_INPUT if DEFAULT_INPUT.exists() else ""))
         self.mode_var = tk.StringVar(value="static_noise")
         self.phone_style_noise_var = tk.StringVar(value="white")
         self.quality_mode_var = tk.StringVar(value="global")
         self.quality_var = tk.DoubleVar(value=0.75)
-        self.transcript_var = tk.StringVar(value="yes")
+        self.max_phoneme_distance_var = tk.StringVar(value=DEFAULT_GLOBAL_BLABBER_MAX_PHONEME_DISTANCE)
+        self.transcript_var = tk.StringVar(value="bath")
         self.breakpoints_var = tk.StringVar(value="auto")
         self.voice_mode_var = tk.StringVar(value="woman")
         self.status_var = tk.StringVar(value="Choose a WAV file and render an augmentation.")
@@ -1227,6 +1234,7 @@ class SpeechDistortionGui:
         self.quality_var.trace_add("write", self._on_blabber_inputs_changed)
         self.mode_var.trace_add("write", self._on_mode_changed)
         self.quality_mode_var.trace_add("write", self._on_blabber_inputs_changed)
+        self.max_phoneme_distance_var.trace_add("write", self._on_blabber_inputs_changed)
         self.voice_mode_var.trace_add("write", self._on_blabber_inputs_changed)
         if self.audio_path_var.get():
             self._load_audio(Path(self.audio_path_var.get()))
@@ -1340,6 +1348,18 @@ class SpeechDistortionGui:
             variable=self.quality_mode_var,
             command=self._update_quality_mode_state,
         ).pack(side=tk.LEFT, padx=(12, 0))
+
+        max_distance_row = ttk.Frame(phoneme_frame)
+        max_distance_row.pack(fill=tk.X, pady=(0, 8))
+        ttk.Label(max_distance_row, text="Max global dist", width=14).pack(side=tk.LEFT)
+        self.max_phoneme_distance_combo = ttk.Combobox(
+            max_distance_row,
+            textvariable=self.max_phoneme_distance_var,
+            values=GLOBAL_BLABBER_MAX_PHONEME_DISTANCE_VALUES,
+            width=8,
+            state="readonly",
+        )
+        self.max_phoneme_distance_combo.pack(side=tk.LEFT)
         self.phoneme_controls_frame = ttk.Frame(phoneme_frame)
         self.phoneme_controls_frame.pack(fill=tk.X, expand=True)
 
@@ -1417,12 +1437,15 @@ class SpeechDistortionGui:
     def _on_transcript_change(self, *_args: object) -> None:
         self._invalidate_blabber_sequence()
         self._refresh_phoneme_controls()
+        self._schedule_live_blabber_sequence_update()
 
     def _on_mode_changed(self, *_args: object) -> None:
         self._invalidate_blabber_sequence()
+        self._schedule_live_blabber_sequence_update()
 
     def _on_blabber_inputs_changed(self, *_args: object) -> None:
         self._invalidate_blabber_sequence()
+        self._schedule_live_blabber_sequence_update()
 
     def _refresh_phoneme_controls(self) -> None:
         for child in self.phoneme_controls_frame.winfo_children():
@@ -1473,8 +1496,13 @@ class SpeechDistortionGui:
         use_per_phoneme = self.quality_mode_var.get() == "per_phoneme"
         if use_per_phoneme:
             self.global_quality_scale.state(["disabled"])
+            self.max_phoneme_distance_combo.state(["disabled"])
         else:
             self.global_quality_scale.state(["!disabled"])
+            if self.mode_var.get() == "blabber":
+                self.max_phoneme_distance_combo.state(["!disabled", "readonly"])
+            else:
+                self.max_phoneme_distance_combo.state(["disabled"])
         for child in self.phoneme_controls_frame.winfo_children():
             for grandchild in child.winfo_children():
                 if isinstance(grandchild, ttk.Scale):
@@ -1499,11 +1527,47 @@ class SpeechDistortionGui:
         else:
             self.voice_mode_combo.state(["disabled"])
             self.generate_sequence_button.state(["disabled"])
+        self._update_quality_mode_state()
 
     def _invalidate_blabber_sequence(self) -> None:
         self.cached_blabber_sequence = None
 
-    def _current_blabber_controls(self) -> tuple[str, float, str, tuple[float, ...]]:
+    def _cancel_live_blabber_sequence_update(self) -> None:
+        if self.live_blabber_sequence_after_id is None:
+            return
+        try:
+            self.root.after_cancel(self.live_blabber_sequence_after_id)
+        except tk.TclError:
+            pass
+        self.live_blabber_sequence_after_id = None
+
+    def _schedule_live_blabber_sequence_update(self) -> None:
+        self._cancel_live_blabber_sequence_update()
+        if self.mode_var.get() != "blabber":
+            return
+        self.live_blabber_sequence_after_id = self.root.after(120, self._refresh_live_blabber_sequence)
+
+    def _refresh_live_blabber_sequence(self) -> None:
+        self.live_blabber_sequence_after_id = None
+        if self.mode_var.get() != "blabber":
+            return
+        try:
+            sequence_payload = self._compute_blabber_sequence()
+        except Exception as exc:
+            self.cached_blabber_sequence = None
+            self._set_output(f"Live blabber sequence unavailable\n\n{exc}")
+            return
+        self.cached_blabber_sequence = sequence_payload
+        self._set_output(self._format_blabber_sequence_status(sequence_payload, cached=True, live=True))
+
+    def _current_global_max_phoneme_distance(self) -> float:
+        try:
+            return max(0.0, float(self.max_phoneme_distance_var.get()))
+        except (TypeError, ValueError):
+            self.max_phoneme_distance_var.set(DEFAULT_GLOBAL_BLABBER_MAX_PHONEME_DISTANCE)
+            return float(DEFAULT_GLOBAL_BLABBER_MAX_PHONEME_DISTANCE)
+
+    def _current_blabber_controls(self) -> tuple[str, float, str, tuple[float, ...], float | None]:
         use_per_phoneme = self.quality_mode_var.get() == "per_phoneme"
         quality = 1.0 if use_per_phoneme else max(0.0, min(1.0, float(self.quality_var.get())))
         phoneme_qualities = (
@@ -1511,10 +1575,18 @@ class SpeechDistortionGui:
             if use_per_phoneme
             else tuple()
         )
-        return self.transcript_var.get().strip(), quality, self.quality_mode_var.get(), phoneme_qualities
+        max_phoneme_distance = None if use_per_phoneme else self._current_global_max_phoneme_distance()
+        return (
+            self.transcript_var.get().strip(),
+            quality,
+            self.quality_mode_var.get(),
+            phoneme_qualities,
+            max_phoneme_distance,
+        )
 
     def _compute_blabber_sequence(self) -> dict[str, object]:
-        transcript, quality, quality_mode, phoneme_qualities = self._current_blabber_controls()
+        transcript, quality, quality_mode, phoneme_qualities, \
+                max_phoneme_distance = self._current_blabber_controls()
         use_per_phoneme = quality_mode == "per_phoneme"
         resolved_phoneme_qualities = list(phoneme_qualities) if use_per_phoneme else None
         (
@@ -1532,6 +1604,7 @@ class SpeechDistortionGui:
             transcript,
             quality,
             resolved_phoneme_qualities,
+            max_phoneme_distance=max_phoneme_distance,
         )
         return {
             "transcript": cleaned,
@@ -1543,6 +1616,7 @@ class SpeechDistortionGui:
             "global_preset_index": preset_index,
             "expansion_used": expansion_used,
             "global_distance_total": total_distance,
+            "global_max_phoneme_distance": max_phoneme_distance,
             "per_phone_preset_indices": per_phone_preset_indices,
             "per_phone_distances": per_phone_distances,
             "per_phone_sequences": per_phone_sequences,
@@ -1552,12 +1626,13 @@ class SpeechDistortionGui:
     def _get_cached_blabber_sequence(self) -> dict[str, object] | None:
         if self.cached_blabber_sequence is None:
             return None
-        transcript, quality, quality_mode, phoneme_qualities = self._current_blabber_controls()
+        transcript, quality, quality_mode, phoneme_qualities, max_phoneme_distance = self._current_blabber_controls()
         if (
             self.cached_blabber_sequence.get("transcript") != transcript.strip()
             or self.cached_blabber_sequence.get("quality") != quality
             or self.cached_blabber_sequence.get("quality_mode") != quality_mode
             or self.cached_blabber_sequence.get("phoneme_qualities") != phoneme_qualities
+            or self.cached_blabber_sequence.get("global_max_phoneme_distance") != max_phoneme_distance
         ):
             self.cached_blabber_sequence = None
             return None
@@ -1567,10 +1642,11 @@ class SpeechDistortionGui:
         self,
         sequence_payload: dict[str, object],
         cached: bool,
+        live: bool = False,
     ) -> str:
         quality_mode = str(sequence_payload["quality_mode"])
         lines = [
-            "Generated blabber sequence",
+            "Live blabber sequence" if live else "Generated blabber sequence",
             f"Transcript: {sequence_payload['transcript']}",
             f"Quality mode: {'per-phoneme' if quality_mode == 'per_phoneme' else 'global'}",
             f"Source phones: {'-'.join(sequence_payload['source_phones'])}",
@@ -1610,6 +1686,8 @@ class SpeechDistortionGui:
                     lines.append("Reference warning: regenerate phoneme_distances.json for smoother per-phoneme ladders")
         else:
             lines.append(f"Quality: {float(sequence_payload['quality']):.2f}")
+            if sequence_payload.get("global_max_phoneme_distance") is not None:
+                lines.append(f"Max global distance: {float(sequence_payload['global_max_phoneme_distance']):.1f}")
             if sequence_payload["global_preset_index"] is not None:
                 lines.append(f"Global preset: {int(sequence_payload['global_preset_index'])}")
             if sequence_payload.get("global_distance_total") is not None:
@@ -1621,6 +1699,7 @@ class SpeechDistortionGui:
         if self.mode_var.get() != "blabber":
             messagebox.showerror("Wrong mode", "Generate Sequence is only available in Blabber mode.")
             return
+        self._cancel_live_blabber_sequence_update()
         try:
             sequence_payload = self._compute_blabber_sequence()
         except Exception as exc:
@@ -1655,6 +1734,7 @@ class SpeechDistortionGui:
             self._set_output(f"Failed to load {path}: {exc}")
 
     def _render(self) -> None:
+        self._cancel_live_blabber_sequence_update()
         path_text = self.audio_path_var.get().strip()
         if not path_text:
             messagebox.showerror("Missing file", "Choose a WAV file first.")
@@ -1824,6 +1904,11 @@ class SpeechDistortionGui:
                             if cached_sequence.get("global_distance_total") is not None
                             else None
                         ),
+                        global_max_phoneme_distance=(
+                            float(cached_sequence["global_max_phoneme_distance"])
+                            if cached_sequence.get("global_max_phoneme_distance") is not None
+                            else None
+                        ),
                     )
         except Exception as exc:
             self.rendered_audio = None
@@ -1854,6 +1939,8 @@ class SpeechDistortionGui:
             details.append(f"Mutated: {metadata.get('substituted_phones', '')}")
             if metadata.get("global_preset_index") is not None:
                 details.append(f"Global preset: {metadata['global_preset_index']}")
+                if metadata.get("global_max_phoneme_distance") is not None:
+                    details.append(f"Max global distance: {metadata['global_max_phoneme_distance']}")
                 if metadata.get("global_distance_total") is not None:
                     details.append(f"Total distance: {metadata['global_distance_total']}")
                 details.append(

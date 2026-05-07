@@ -114,6 +114,71 @@ def test_global_blabber_ladder_uses_distinct_distance_sorted_word_states(tmp_pat
     assert [item["total_distance"] for item in ladder[:5]] == [0.0, 0.05, 0.1, 0.15, 0.2]
 
 
+def test_global_blabber_ladder_caps_per_phoneme_distance(tmp_path: Path) -> None:
+    payload = [
+        {
+            "phone": "S",
+            "ranked_candidate_entries_near_to_far": [
+                {"phones": ["SH"], "distance": 0.1, "rank": 0},
+                {"phones": ["Z"], "distance": 0.6, "rank": 1},
+            ],
+        },
+        {
+            "phone": "T",
+            "ranked_candidate_entries_near_to_far": [
+                {"phones": ["D"], "distance": 0.1, "rank": 0},
+                {"phones": ["K"], "distance": 0.6, "rank": 1},
+            ],
+        },
+    ]
+    reference_path = tmp_path / "phoneme_distances.json"
+    reference_path.write_text(json.dumps(payload), encoding="utf-8")
+
+    ladder = build_global_blabber_ladder(
+        ["S", "T"],
+        reference_path=str(reference_path),
+        preset_count=6,
+        max_phoneme_distance=0.1,
+    )
+
+    assert all("Z" not in item["mutated_phones"] for item in ladder)
+    assert all("K" not in item["mutated_phones"] for item in ladder)
+    assert all(float(item["total_distance"]) <= 0.1 for item in ladder)
+    assert ladder[-1]["total_distance"] == 0.1
+
+
+def test_global_blabber_ladder_scales_gradations_to_max_phoneme_distance(tmp_path: Path) -> None:
+    payload = [
+        {
+            "phone": "S",
+            "ranked_candidate_entries_near_to_far": [
+                {"phones": ["SH"], "distance": 0.1, "rank": 0},
+                {"phones": ["Z"], "distance": 0.6, "rank": 1},
+            ],
+        },
+        {
+            "phone": "T",
+            "ranked_candidate_entries_near_to_far": [
+                {"phones": ["D"], "distance": 0.1, "rank": 0},
+                {"phones": ["K"], "distance": 0.6, "rank": 1},
+            ],
+        },
+    ]
+    reference_path = tmp_path / "phoneme_distances.json"
+    reference_path.write_text(json.dumps(payload), encoding="utf-8")
+
+    ladder = build_global_blabber_ladder(
+        ["S", "T"],
+        reference_path=str(reference_path),
+        preset_count=5,
+        max_phoneme_distance=0.6,
+    )
+
+    assert all(float(item["total_distance"]) <= 0.6 for item in ladder)
+    assert [round(float(item["total_distance"]), 1) for item in ladder] == [0.0, 0.1, 0.2, 0.6, 0.6]
+    assert ladder[-1]["total_distance"] == 0.6
+
+
 def test_resolve_global_blabber_sequences_maps_quality_to_unique_preset_states(tmp_path: Path) -> None:
     payload = [
         {
