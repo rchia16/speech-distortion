@@ -970,8 +970,10 @@ def render_blabber_from_resolved_phones(
     if per_phone_preset_indices is not None:
         metadata["per_phone_preset_indices"] = ",".join(str(int(value)) for value in per_phone_preset_indices)
     if per_phone_distances is not None:
+        whole_word_distance_total = sum(float(value) for value in per_phone_distances)
         metadata["per_phone_distances"] = ",".join(f"{float(value):.6f}" for value in per_phone_distances)
-        metadata["per_phone_distance_total"] = f"{sum(float(value) for value in per_phone_distances):.6f}"
+        metadata["per_phone_distance_total"] = f"{whole_word_distance_total:.6f}"
+        metadata["whole_word_distance_total"] = f"{whole_word_distance_total:.6f}"
     if per_phone_sequences is not None:
         metadata["per_phone_sequences"] = ";".join("-".join(sequence) for sequence in per_phone_sequences)
     if per_phone_numeric_entries_used is not None:
@@ -1616,6 +1618,7 @@ class SpeechDistortionGui:
             "global_preset_index": preset_index,
             "expansion_used": expansion_used,
             "global_distance_total": total_distance,
+            "whole_word_distance_total": total_distance,
             "global_max_phoneme_distance": max_phoneme_distance,
             "per_phone_preset_indices": per_phone_preset_indices,
             "per_phone_distances": per_phone_distances,
@@ -1668,6 +1671,8 @@ class SpeechDistortionGui:
                     "Per-phone distances: "
                     + ",".join(f"{float(value):.4f}" for value in sequence_payload["per_phone_distances"])
                 )
+            if sequence_payload.get("whole_word_distance_total") is not None:
+                lines.append(f"Whole-word distance: {float(sequence_payload['whole_word_distance_total']):.4f}")
             if sequence_payload.get("per_phone_sequences") is not None:
                 lines.append(
                     "Per-phone sequences: "
@@ -1950,6 +1955,8 @@ class SpeechDistortionGui:
                 details.append(f"Per-phone presets: {metadata['per_phone_preset_indices']}")
             if metadata.get("per_phone_distances"):
                 details.append(f"Per-phone distances: {metadata['per_phone_distances']}")
+            if metadata.get("whole_word_distance_total"):
+                details.append(f"Whole-word distance: {metadata['whole_word_distance_total']}")
             if metadata.get("per_phone_numeric_entries_used") is not None:
                 details.append(
                     "Reference entries: numeric candidate distances"

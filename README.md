@@ -110,6 +110,7 @@ The default demo input is `yes_slow.wav` when present in the repo root.
   - `per_phone_preset_indices`
   - `per_phone_distances`
   - `per_phone_distance_total`
+  - `whole_word_distance_total`
   - `per_phone_sequences`
   - `per_phone_numeric_entries_used`
   - `per_phone_reference_warning`

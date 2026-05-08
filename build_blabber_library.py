@@ -433,6 +433,7 @@ def render_blabber_per_phoneme(
         per_phone_preset_indices=",".join(str(int(value)) for value in per_phone_preset_indices),
         per_phone_distances=",".join(f"{float(value):.6f}" for value in per_phone_distances),
         per_phone_distance_total=f"{total_distance:.6f}",
+        whole_word_distance_total=f"{total_distance:.6f}",
         per_phone_sequences=";".join("-".join(sequence) for sequence in per_phone_sequences),
         expansion_used="1" if expansion_used else "0",
         per_phone_numeric_entries_used="1" if per_phone_numeric_entries_used else "0",
@@ -582,7 +583,8 @@ def build_sidecar_payload(
 ) -> dict[str, Any]:
     source_spans = derive_phone_sample_spans(source_audio, source_phones)
     output_spans = derive_phone_sample_spans(rendered_audio, mutated_phones)
-    return {
+    whole_word_distance_total = rendered_audio.metadata.get("whole_word_distance_total")
+    payload = {
         "input_audio_path": str(input_audio_path),
         "output_audio_path": str(output_audio_path),
         "transcript": transcript,
@@ -603,6 +605,9 @@ def build_sidecar_payload(
         },
         "metadata": dict(rendered_audio.metadata),
     }
+    if whole_word_distance_total:
+        payload["whole_word_distance_total"] = float(whole_word_distance_total)
+    return payload
 
 
 def generate_phoneme_value_sets(phoneme_count: int) -> list[list[float]]:
@@ -749,6 +754,7 @@ def process_entry(
                     "output_phonemes": mutated_phones,
                     "voice_mode": rendered_audio.metadata.get("voice_mode", LIBRARY_BLABBER_VOICE_MODE),
                     "phoneme_values": phoneme_values,
+                    "whole_word_distance_total": float(rendered_audio.metadata["whole_word_distance_total"]),
                 }
             )
 
