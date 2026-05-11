@@ -45,10 +45,13 @@ from speech_distortion_pipeline.resynthesis.fragment_synthesizer import (
     resolve_python_command,
 )
 from speech_distortion_pipeline.resynthesis.phoneme_render_backend import (
+    DEFAULT_KOKORO_VOICE,
     PHONEME_RENDER_BACKEND_COQUI_TACOTRON2_DDC_PH,
     PHONEME_RENDER_BACKEND_FASTPITCH,
     PHONEME_RENDER_BACKEND_KOKORO,
+    PHONEME_RENDER_BACKEND_PHONEME_VITS,
     PHONEME_RENDER_BACKENDS,
+    KOKORO_VOICE_OPTIONS,
     backend_metadata,
     default_woman_phoneme_render_backend,
     probe_phoneme_render_backend,
@@ -62,6 +65,10 @@ from speech_distortion_pipeline.resynthesis.style_transfer import (
 )
 
 LIBRARY_BLABBER_VOICE_MODE = "woman"
+GENERATION_MODE_BOTH = "both"
+ASSET_BANK_GLOBAL = "global"
+ASSET_BANK_PER_PHONEME = "per_phoneme"
+DEFAULT_LIBRARY_PHONEME_RENDER_BACKEND = PHONEME_RENDER_BACKEND_KOKORO
 
 
 @dataclass
@@ -415,6 +422,7 @@ def render_blabber_per_phoneme(
     transcript: str,
     phoneme_qualities: Sequence[float],
     phoneme_render_backend: str = PHONEME_RENDER_BACKEND_COQUI_TACOTRON2_DDC_PH,
+    backend_voice: str | None = None,
     style_transfer_backend: str = STYLE_TRANSFER_BACKEND_NONE,
     style_transfer_target_voice: str = "",
     style_transfer_presets_path: str | Path | None = None,
@@ -457,6 +465,7 @@ def render_blabber_per_phoneme(
                 mutated_phones,
                 backend=phoneme_render_backend,
                 conda_env_name=COQUI_ENV_NAME,
+                backend_voice=backend_voice,
             )
             output = np.asarray(result.samples, dtype=np.float32)
             coqui_model_name = result.model_name
@@ -505,6 +514,7 @@ def render_blabber_global(
     quality: float,
     max_phoneme_distance: float | None = None,
     phoneme_render_backend: str = PHONEME_RENDER_BACKEND_COQUI_TACOTRON2_DDC_PH,
+    backend_voice: str | None = None,
     style_transfer_backend: str = STYLE_TRANSFER_BACKEND_NONE,
     style_transfer_target_voice: str = "",
     style_transfer_presets_path: str | Path | None = None,
@@ -527,6 +537,7 @@ def render_blabber_global(
                 mutated_phones,
                 backend=phoneme_render_backend,
                 conda_env_name=COQUI_ENV_NAME,
+                backend_voice=backend_voice,
             )
             output = np.asarray(result.samples, dtype=np.float32)
             coqui_model_name = result.model_name
@@ -574,6 +585,31 @@ def format_quality_token(value: float) -> str:
 
 def safe_word_token(word: str) -> str:
     return "".join(char.lower() if char.isalnum() else "_" for char in word).strip("_") or "word"
+
+
+def relative_to_root(path: Path, root: Path) -> str:
+    return str(path.resolve().relative_to(root.resolve()))
+
+
+def normalize_builder_generation_mode(value: str) -> str:
+    normalized = str(value).strip().lower()
+    if normalized not in {GENERATION_MODE_BOTH, "global_soft", ASSET_BANK_PER_PHONEME}:
+        raise ValueError(
+            f"Unsupported generation mode '{value}'. Expected one of: {GENERATION_MODE_BOTH}, global_soft, {ASSET_BANK_PER_PHONEME}."
+        )
+    return normalized
+
+
+def normalize_library_backend_voice(backend: str, backend_voice: str | None) -> str | None:
+    normalized_backend = str(backend).strip().lower()
+    if normalized_backend != PHONEME_RENDER_BACKEND_KOKORO:
+        return None
+    requested = (backend_voice or DEFAULT_KOKORO_VOICE).strip().lower()
+    if requested not in KOKORO_VOICE_OPTIONS:
+        raise ValueError(
+            f"Unsupported Kokoro voice '{backend_voice}'. Expected one of: {', '.join(KOKORO_VOICE_OPTIONS)}."
+        )
+    return requested
 
 
 def manifest_row_to_entry(row: dict[str, Any], manifest_path: Path) -> ManifestEntry:
@@ -654,6 +690,7 @@ def build_sidecar_payload(
     input_audio_path: Path,
     output_audio_path: Path,
     transcript: str,
+    generation_mode: str,
     phoneme_values: Sequence[float],
     source_audio: AudioBuffer,
     rendered_audio: AudioBuffer,
@@ -667,6 +704,8 @@ def build_sidecar_payload(
         "input_audio_path": str(input_audio_path),
         "output_audio_path": str(output_audio_path),
         "transcript": transcript,
+        "word": transcript,
+        "generation_mode": generation_mode,
         "phoneme_values": [clamp_unit(float(value)) for value in phoneme_values],
         "source_phoneme_count": len(source_phones),
         "output_phoneme_count": len(mutated_phones),
@@ -723,13 +762,14 @@ def generate_global_quality_presets(
 
 def process_entry(
     entry: ManifestEntry,
-    output_dir: Path,
+    output_root: Path,
     overwrite: bool,
     reader: WavAudioReader,
     writer: WavAudioWriter,
     generation_mode: str,
     global_max_phoneme_distance: float | None = None,
     phoneme_render_backend: str = PHONEME_RENDER_BACKEND_COQUI_TACOTRON2_DDC_PH,
+    backend_voice: str | None = None,
     style_transfer_backend: str = STYLE_TRANSFER_BACKEND_NONE,
     style_transfer_target_voice: str = "",
     style_transfer_presets_path: str | Path | None = None,
@@ -748,6 +788,8 @@ def process_entry(
     generated_items: list[dict[str, Any]] = []
     stem = safe_word_token(entry.transcript)
     if generation_mode == "global_soft":
+        word_output_dir = output_root / ASSET_BANK_GLOBAL / stem
+        word_output_dir.mkdir(parents=True, exist_ok=True)
         for preset_index, quality in generate_global_quality_presets():
             (
                 rendered_audio,
@@ -762,12 +804,13 @@ def process_entry(
                 quality,
                 max_phoneme_distance=global_max_phoneme_distance,
                 phoneme_render_backend=phoneme_render_backend,
+                backend_voice=backend_voice,
                 style_transfer_backend=style_transfer_backend,
                 style_transfer_target_voice=style_transfer_target_voice,
                 style_transfer_presets_path=style_transfer_presets_path,
             )
 
-            output_audio_path = output_dir / (
+            output_audio_path = word_output_dir / (
                 f"{stem}_global_p{preset_index:02d}_q{format_quality_token(quality)}.wav"
             )
             output_json_path = output_audio_path.with_suffix(".json")
@@ -782,6 +825,7 @@ def process_entry(
                 entry.audio_path,
                 output_audio_path,
                 entry.transcript.strip(),
+                ASSET_BANK_GLOBAL,
                 [quality],
                 audio,
                 rendered_audio,
@@ -793,10 +837,13 @@ def process_entry(
             generated_items.append(
                 {
                     "transcript": entry.transcript.strip(),
-                    "audio_path": str(output_audio_path),
-                    "json_path": str(output_json_path),
+                    "word": entry.transcript.strip(),
+                    "audio_path": relative_to_root(output_audio_path, output_root),
+                    "json_path": relative_to_root(output_json_path, output_root),
+                    "sidecar_path": relative_to_root(output_json_path, output_root),
                     "source_phonemes": source_phones,
                     "output_phonemes": mutated_phones,
+                    "generation_mode": ASSET_BANK_GLOBAL,
                     "quality": quality,
                     "voice_mode": rendered_audio.metadata.get("voice_mode", LIBRARY_BLABBER_VOICE_MODE),
                     "global_preset_index": resolved_preset_index,
@@ -810,19 +857,22 @@ def process_entry(
                 }
             )
     else:
+        word_output_dir = output_root / ASSET_BANK_PER_PHONEME / stem
+        word_output_dir.mkdir(parents=True, exist_ok=True)
         for phoneme_values in generate_phoneme_value_sets(entry.phoneme_count):
             rendered_audio, source_phones, mutated_phones = render_blabber_per_phoneme(
                 audio,
                 entry.transcript,
                 phoneme_values,
                 phoneme_render_backend=phoneme_render_backend,
+                backend_voice=backend_voice,
                 style_transfer_backend=style_transfer_backend,
                 style_transfer_target_voice=style_transfer_target_voice,
                 style_transfer_presets_path=style_transfer_presets_path,
             )
 
             quality_suffix = "_".join(format_quality_token(value) for value in phoneme_values)
-            output_audio_path = output_dir / f"{stem}_{quality_suffix}.wav"
+            output_audio_path = word_output_dir / f"{stem}_per_phoneme_{quality_suffix}.wav"
             output_json_path = output_audio_path.with_suffix(".json")
 
             if not overwrite and (output_audio_path.exists() or output_json_path.exists()):
@@ -835,6 +885,7 @@ def process_entry(
                 entry.audio_path,
                 output_audio_path,
                 entry.transcript.strip(),
+                ASSET_BANK_PER_PHONEME,
                 phoneme_values,
                 audio,
                 rendered_audio,
@@ -846,10 +897,13 @@ def process_entry(
             generated_items.append(
                 {
                     "transcript": entry.transcript.strip(),
-                    "audio_path": str(output_audio_path),
-                    "json_path": str(output_json_path),
+                    "word": entry.transcript.strip(),
+                    "audio_path": relative_to_root(output_audio_path, output_root),
+                    "json_path": relative_to_root(output_json_path, output_root),
+                    "sidecar_path": relative_to_root(output_json_path, output_root),
                     "source_phonemes": source_phones,
                     "output_phonemes": mutated_phones,
+                    "generation_mode": ASSET_BANK_PER_PHONEME,
                     "voice_mode": rendered_audio.metadata.get("voice_mode", LIBRARY_BLABBER_VOICE_MODE),
                     "phoneme_values": phoneme_values,
                     "whole_word_distance_total": float(rendered_audio.metadata["whole_word_distance_total"]),
@@ -862,9 +916,26 @@ def process_entry(
 
     return {
         "transcript": entry.transcript.strip(),
+        "word": entry.transcript.strip(),
+        "generation_mode": ASSET_BANK_GLOBAL if generation_mode == "global_soft" else ASSET_BANK_PER_PHONEME,
         "generated_count": len(generated_items),
         "items": generated_items,
     }
+
+
+def build_root_asset_index(generated: Sequence[dict[str, Any]]) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for item in generated:
+        for asset in item.get("items", []):
+            row = dict(asset)
+            row.setdefault("transcript", item.get("transcript", ""))
+            row.setdefault("word", item.get("word", item.get("transcript", "")))
+            rows.append(row)
+    return rows
+
+
+def filter_generated_by_mode(generated: Sequence[dict[str, Any]], generation_mode: str) -> list[dict[str, Any]]:
+    return [dict(item) for item in generated if item.get("generation_mode") == generation_mode]
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
@@ -892,9 +963,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--generation-mode",
-        choices=("global_soft", "per_phoneme"),
-        default="global_soft",
-        help="Generate softened global blabber presets or the original per-phoneme permutations.",
+        choices=(GENERATION_MODE_BOTH, "global_soft", "per_phoneme"),
+        default=GENERATION_MODE_BOTH,
+        help="Generate both banks by default, or restrict output to global_soft or per_phoneme.",
     )
     parser.add_argument(
         "--global-max-phoneme-distance",
@@ -908,8 +979,14 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--phoneme-render-backend",
         choices=PHONEME_RENDER_BACKENDS,
-        default=default_woman_phoneme_render_backend(),
+        default=DEFAULT_LIBRARY_PHONEME_RENDER_BACKEND,
         help="Direct phoneme render backend for woman Blabber generation.",
+    )
+    parser.add_argument(
+        "--kokoro-voice",
+        choices=KOKORO_VOICE_OPTIONS,
+        default=DEFAULT_KOKORO_VOICE,
+        help="Kokoro voice used when --phoneme-render-backend=kokoro.",
     )
     parser.add_argument(
         "--style-transfer-backend",
@@ -943,7 +1020,16 @@ def main() -> int:
     output_dir = Path(args.output_dir).resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    ensure_coqui_backend(COQUI_ENV_NAME)
+    normalized_generation_mode = normalize_builder_generation_mode(str(args.generation_mode))
+    backend_voice = normalize_library_backend_voice(str(args.phoneme_render_backend), str(args.kokoro_voice))
+    if (
+        str(args.phoneme_render_backend) in {
+            PHONEME_RENDER_BACKEND_COQUI_TACOTRON2_DDC_PH,
+            PHONEME_RENDER_BACKEND_PHONEME_VITS,
+        }
+        or str(args.style_transfer_backend) != STYLE_TRANSFER_BACKEND_NONE
+    ):
+        ensure_coqui_backend(COQUI_ENV_NAME)
     if args.print_backend_probes:
         probes = [
             {
@@ -967,26 +1053,45 @@ def main() -> int:
 
     reader = WavAudioReader()
     writer = WavAudioWriter()
-    generated = [
-        process_entry(
-            entry,
-            output_dir,
-            args.overwrite,
-            reader,
-            writer,
-            str(args.generation_mode),
-            global_max_phoneme_distance=(
-                max(0.0, float(args.global_max_phoneme_distance))
-                if args.global_max_phoneme_distance is not None
-                else None
-            ),
-            phoneme_render_backend=str(args.phoneme_render_backend),
-            style_transfer_backend=str(args.style_transfer_backend),
-            style_transfer_target_voice=str(args.style_transfer_target_voice),
-            style_transfer_presets_path=Path(args.style_transfer_presets).resolve(),
-        )
-        for entry in entries
-    ]
+    selected_modes = (
+        ("global_soft", "per_phoneme")
+        if normalized_generation_mode == GENERATION_MODE_BOTH
+        else (normalized_generation_mode,)
+    )
+    generated: list[dict[str, Any]] = []
+    for entry in entries:
+        for selected_mode in selected_modes:
+            generated.append(
+                process_entry(
+                    entry,
+                    output_dir,
+                    args.overwrite,
+                    reader,
+                    writer,
+                    selected_mode,
+                    global_max_phoneme_distance=(
+                        max(0.0, float(args.global_max_phoneme_distance))
+                        if args.global_max_phoneme_distance is not None
+                        else None
+                    ),
+                    phoneme_render_backend=str(args.phoneme_render_backend),
+                    backend_voice=backend_voice,
+                    style_transfer_backend=str(args.style_transfer_backend),
+                    style_transfer_target_voice=str(args.style_transfer_target_voice),
+                    style_transfer_presets_path=Path(args.style_transfer_presets).resolve(),
+                )
+            )
+
+    root_index = build_root_asset_index(generated)
+    (output_dir / "blabber_asset_index.json").write_text(json.dumps(root_index, indent=2), encoding="utf-8")
+    (output_dir / "global_summary.json").write_text(
+        json.dumps(filter_generated_by_mode(generated, ASSET_BANK_GLOBAL), indent=2),
+        encoding="utf-8",
+    )
+    (output_dir / "per_phoneme_summary.json").write_text(
+        json.dumps(filter_generated_by_mode(generated, ASSET_BANK_PER_PHONEME), indent=2),
+        encoding="utf-8",
+    )
 
     if args.print_summary_json:
         print(json.dumps(generated, indent=2))

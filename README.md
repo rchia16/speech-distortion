@@ -253,6 +253,12 @@ The builder renders the female/woman preset voice first and can now optionally a
 style-transfer stage on the generated audio.
 For `global_soft` generation, `--global-max-phoneme-distance` applies the same per-phone distance cap as the GUI.
 
+Basic run flow:
+
+1. Create a manifest with `audio_path`, `transcript`, and `phoneme_count`.
+2. Run the builder against that manifest.
+3. Read outputs from the generated `global/` and `per_phoneme/` subdirectories plus the root summary JSON files.
+
 Supported manifest formats:
 
 - `.csv`
@@ -273,22 +279,64 @@ audio_path,transcript,phoneme_count
 yes_slow.wav,yes,3
 ```
 
-Example runs:
+Default run:
 
 ```powershell
 python build_blabber_library.py --manifest blabber_manifest.csv --output-dir speech-assets
+```
+
+This default command:
+
+- generates both `global` and `per_phoneme` banks
+- uses `kokoro` as the phoneme backend
+- uses Kokoro voice `bf_emma`
+- writes an asset index and per-mode summaries at the output root
+
+Common variants:
+
+```powershell
+python build_blabber_library.py --manifest blabber_manifest.csv --output-dir speech-assets --generation-mode global_soft
+python build_blabber_library.py --manifest blabber_manifest.csv --output-dir speech-assets --generation-mode per_phoneme
+python build_blabber_library.py --manifest blabber_manifest.csv --output-dir speech-assets --kokoro-voice gm_fable
 python build_blabber_library.py --manifest blabber_manifest.csv --output-dir speech-assets --style-transfer-backend openvoice_v2 --style-transfer-target-voice male_demo
+```
+
+Expected output layout:
+
+```text
+speech-assets/
+  blabber_asset_index.json
+  global_summary.json
+  per_phoneme_summary.json
+  global/
+    yes/
+      yes_global_p00_q1.wav
+      yes_global_p00_q1.json
+      ...
+  per_phoneme/
+    yes/
+      yes_per_phoneme_1_0_0.wav
+      yes_per_phoneme_1_0_0.json
+      ...
 ```
 
 Current behavior:
 
-- default generation mode is `global_soft`, which now means deterministic global distance progression
-- default direct phoneme render backend is `coqui_tacotron2_ddc_ph`
+- default generation mode is `both`, which writes separate `global` and `per_phoneme` banks in one run
+- default direct phoneme render backend is `kokoro`
+- default builder Kokoro voice is `bf_emma`
 - global generation produces `GLOBAL_BLABBER_PRESET_COUNT` ordered outputs per word
 - per-phoneme deterministic ladders use `PER_PHONEME_BLABBER_PRESET_COUNT`
 - per-phoneme generation remains available as the original combinatorial mode
 - generated Blabber metadata includes global or per-phone distance information depending on generation mode
 - generated Blabber metadata now also includes `voice_mode`, `coqui_model_name`, and style-transfer status fields
+- generated assets are organized as:
+  - `speech-assets/global/<word>/...`
+  - `speech-assets/per_phoneme/<word>/...`
+- the output root now also writes:
+  - `blabber_asset_index.json`
+  - `global_summary.json`
+  - `per_phoneme_summary.json`
 - each generated asset also writes a `.json` sidecar with:
   - `phoneme_values`
   - `source_phonemes`
@@ -302,7 +350,9 @@ Notes:
 - `phoneme_count` must exactly match the detected source phoneme count for that word
 - Coqui must be installed in the configured `BLABBER_CONDA_ENV`
 - the builder currently uses only the configured woman preset model
+- `--generation-mode both|global_soft|per_phoneme` controls whether one or both banks are written
 - `--phoneme-render-backend` can be used to try `coqui_tacotron2_ddc_ph`, `fastpitch`, `kokoro`, or `phoneme_vits`
+- `--kokoro-voice bf_emma|gm_fable` overrides the default Kokoro export voice when `--phoneme-render-backend=kokoro`
 - `--style-transfer-backend openvoice_v2` applies Coqui OpenVoice v2 after the woman render
 - `--style-transfer-target-voice` must match a preset name from `config/style_transfer_presets.json`
 
@@ -356,13 +406,15 @@ Experimental backend constraints:
 The selector is local-path based and does not hard-code external dataset roots. It expects:
 
 - a saved comparison result payload from `compare_signal_to_prebuilt_template(...)`
-- a local JSON asset index
+- a local JSON asset index, or a generated asset root it can scan
 - a requested voice bank: `female`/`woman` or `male`/`man`
 - a known target word, or a `label_name` already present in the comparison result
+- optional generation-mode preference: `auto`, `global`, or `per_phoneme`
 
 Selection behavior:
 
 - supports both template result shapes
+- loads `blabber_asset_index.json` first when present, and otherwise scans `global/<word>/` and `per_phoneme/<word>/`
 - uses the comparison `times` and `per_time_l2` arrays as the mismatch timeline
 - uses asset `source_alignment` sidecars to estimate phoneme spans
 - averages mismatch within each phoneme span

@@ -12,12 +12,17 @@ from typing import Any, Iterable, Sequence
 
 ROOT = Path(__file__).resolve().parent
 DEFAULT_ASSET_INDEX_PATH = ROOT / "blabber_asset_index.json"
+ASSET_MODE_AUTO = "auto"
+ASSET_MODE_GLOBAL = "global"
+ASSET_MODE_PER_PHONEME = "per_phoneme"
+ASSET_MODES = (ASSET_MODE_AUTO, ASSET_MODE_GLOBAL, ASSET_MODE_PER_PHONEME)
 
 
 @dataclass(frozen=True)
 class AssetCandidate:
     word: str
     voice_mode: str
+    generation_mode: str
     phoneme_values: tuple[float, ...]
     audio_path: Path
     sidecar_path: Path
@@ -49,6 +54,15 @@ def normalize_voice_mode(value: str) -> str:
     if normalized not in aliases:
         raise ValueError("Voice must be one of: female, woman, male, man.")
     return aliases[normalized]
+
+
+def normalize_asset_mode(value: str) -> str:
+    normalized = str(value).strip().lower()
+    if normalized == "global_soft":
+        return ASSET_MODE_GLOBAL
+    if normalized not in ASSET_MODES:
+        raise ValueError(f"Generation mode must be one of: {', '.join(ASSET_MODES)}.")
+    return normalized
 
 
 def _resolve_path(path_value: str | Path, base_dir: Path) -> Path:
@@ -100,6 +114,7 @@ def load_asset_index(index_path: Path) -> list[AssetCandidate]:
     for row in rows:
         word_value = row.get("word") or row.get("transcript") or row.get("label_name")
         voice_value = row.get("voice_mode") or row.get("voice") or row.get("gender")
+        generation_mode = row.get("generation_mode") or row.get("mode") or row.get("bank") or ASSET_MODE_PER_PHONEME
         audio_value = row.get("audio_path") or row.get("output_audio_path") or row.get("file")
         sidecar_value = row.get("sidecar_path") or row.get("json_path") or row.get("metadata_path")
         phoneme_values = row.get("phoneme_values")
@@ -123,6 +138,7 @@ def load_asset_index(index_path: Path) -> list[AssetCandidate]:
             AssetCandidate(
                 word=normalize_word(str(word_value)),
                 voice_mode=normalize_voice_mode(str(voice_value)),
+                generation_mode=normalize_asset_mode(str(generation_mode)),
                 phoneme_values=_coerce_float_list(phoneme_values, "phoneme_values"),
                 audio_path=_resolve_path(audio_value, base_dir),
                 sidecar_path=_resolve_path(sidecar_value, base_dir),
@@ -131,6 +147,50 @@ def load_asset_index(index_path: Path) -> list[AssetCandidate]:
                 raw=dict(row),
             )
         )
+    return candidates
+
+
+def scan_asset_root(asset_root: Path) -> list[AssetCandidate]:
+    candidates: list[AssetCandidate] = []
+    for generation_mode in (ASSET_MODE_GLOBAL, ASSET_MODE_PER_PHONEME):
+        mode_root = asset_root / generation_mode
+        if not mode_root.is_dir():
+            continue
+        for sidecar_path in sorted(mode_root.glob("*/*.json")):
+            payload = json.loads(sidecar_path.read_text(encoding="utf-8"))
+            if not isinstance(payload, dict):
+                continue
+            metadata = payload.get("metadata") if isinstance(payload.get("metadata"), dict) else {}
+            word_value = payload.get("word") or payload.get("transcript") or metadata.get("transcript")
+            source_phonemes = payload.get("source_phonemes")
+            phoneme_values = payload.get("phoneme_values")
+            if not word_value or source_phonemes is None or phoneme_values is None:
+                continue
+            audio_value = payload.get("output_audio_path") or sidecar_path.with_suffix(".wav").name
+            label_id = payload.get("label_id", metadata.get("label_id"))
+            resolved_audio_path = _resolve_path(audio_value, sidecar_path.parent)
+            candidates.append(
+                AssetCandidate(
+                    word=normalize_word(str(word_value)),
+                    voice_mode=normalize_voice_mode(str(metadata.get("voice_mode", "woman"))),
+                    generation_mode=generation_mode,
+                    phoneme_values=_coerce_float_list(phoneme_values, "phoneme_values"),
+                    audio_path=resolved_audio_path,
+                    sidecar_path=sidecar_path.resolve(),
+                    source_phonemes=_coerce_string_list(source_phonemes, "source_phonemes"),
+                    label_id=int(label_id) if label_id is not None else None,
+                    raw={
+                        "word": str(word_value),
+                        "transcript": str(word_value),
+                        "voice_mode": metadata.get("voice_mode", "woman"),
+                        "generation_mode": generation_mode,
+                        "audio_path": str(resolved_audio_path),
+                        "sidecar_path": str(sidecar_path.resolve()),
+                        "source_phonemes": list(source_phonemes),
+                        "phoneme_values": list(phoneme_values),
+                    },
+                )
+            )
     return candidates
 
 
@@ -248,6 +308,18 @@ def _selection_distance(requested: Sequence[float], candidate: Sequence[float]) 
     return (sum(deltas), max(deltas) if deltas else 0.0)
 
 
+def _requested_grade_signature(
+    phoneme_scores: Sequence[dict[str, Any]],
+    generation_mode: str,
+) -> tuple[float, ...]:
+    if normalize_asset_mode(generation_mode) == ASSET_MODE_GLOBAL:
+        if not phoneme_scores:
+            return (0.0,)
+        mean_grade = sum(float(item["mean_mismatch"]) for item in phoneme_scores) / float(len(phoneme_scores))
+        return (clamp_unit(mean_grade),)
+    return tuple(float(item["rounded_grade"]) for item in phoneme_scores)
+
+
 def _build_selection_result(
     comparison: dict[str, Any],
     candidate: AssetCandidate,
@@ -258,10 +330,12 @@ def _build_selection_result(
     exact_match: bool,
 ) -> dict[str, Any]:
     requested_grades = [float(item["rounded_grade"]) for item in phoneme_scores]
-    distance_sum, distance_max = _selection_distance(requested_grades, candidate.phoneme_values)
+    requested_signature = _requested_grade_signature(phoneme_scores, candidate.generation_mode)
+    distance_sum, distance_max = _selection_distance(requested_signature, candidate.phoneme_values)
     return {
         "word": requested_word,
         "voice_mode": requested_voice,
+        "generation_mode": candidate.generation_mode,
         "comparison_source": comparison["source"],
         "comparison_label_name": comparison.get("label_name"),
         "comparison_label_id": comparison.get("label_id"),
@@ -270,6 +344,7 @@ def _build_selection_result(
         "sidecar_path": str(candidate.sidecar_path),
         "source_phonemes": list(candidate.source_phonemes),
         "requested_phoneme_grades": requested_grades,
+        "requested_generation_signature": list(requested_signature),
         "selected_phoneme_grades": [float(value) for value in candidate.phoneme_values],
         "phoneme_scores": list(phoneme_scores),
         "per_time_l2": list(comparison["per_time_l2"]),
@@ -288,6 +363,7 @@ def select_asset(
     requested_voice: str,
     target_word: str | None = None,
     target_label_id: int | None = None,
+    generation_mode: str = ASSET_MODE_AUTO,
 ) -> dict[str, Any]:
     resolved_word = normalize_word(
         target_word or comparison.get("label_name") or ""
@@ -295,11 +371,13 @@ def select_asset(
     if not resolved_word and target_label_id is None and comparison.get("label_id") is None:
         raise ValueError("A target word, target label id, or comparison label must be available for selection.")
 
+    normalized_generation_mode = normalize_asset_mode(generation_mode)
     resolved_label_id = target_label_id if target_label_id is not None else comparison.get("label_id")
     filtered = [
         candidate
         for candidate in candidates
         if candidate.voice_mode == requested_voice
+        and (normalized_generation_mode == ASSET_MODE_AUTO or candidate.generation_mode == normalized_generation_mode)
         and (
             candidate.word == resolved_word
             or (resolved_label_id is not None and candidate.label_id == resolved_label_id)
@@ -307,7 +385,7 @@ def select_asset(
     ]
     if not filtered:
         raise ValueError(
-            f"No assets found for word='{resolved_word or '<unknown>'}' voice='{requested_voice}'."
+            f"No assets found for word='{resolved_word or '<unknown>'}' voice='{requested_voice}' mode='{normalized_generation_mode}'."
         )
 
     sidecars: list[tuple[AssetCandidate, dict[str, Any]]] = []
@@ -325,11 +403,10 @@ def select_asset(
         comparison["per_time_l2"],
         source_alignment,
     )
-    requested_grades = tuple(float(item["rounded_grade"]) for item in phoneme_scores)
-
     compatible: list[tuple[AssetCandidate, dict[str, Any]]] = []
     for candidate, sidecar in sidecars:
-        if len(candidate.phoneme_values) != len(requested_grades):
+        requested_signature = _requested_grade_signature(phoneme_scores, candidate.generation_mode)
+        if len(candidate.phoneme_values) != len(requested_signature):
             continue
         compatible.append((candidate, sidecar))
     if not compatible:
@@ -338,7 +415,11 @@ def select_asset(
             f"{len(requested_grades)}."
         )
 
-    exact = [(candidate, sidecar) for candidate, sidecar in compatible if candidate.phoneme_values == requested_grades]
+    exact = [
+        (candidate, sidecar)
+        for candidate, sidecar in compatible
+        if candidate.phoneme_values == _requested_grade_signature(phoneme_scores, candidate.generation_mode)
+    ]
     if exact:
         exact.sort(key=lambda item: str(item[0].audio_path))
         chosen_candidate, chosen_sidecar = exact[0]
@@ -355,7 +436,11 @@ def select_asset(
     ranked = sorted(
         compatible,
         key=lambda item: (
-            _selection_distance(requested_grades, item[0].phoneme_values),
+            _selection_distance(
+                _requested_grade_signature(phoneme_scores, item[0].generation_mode),
+                item[0].phoneme_values,
+            ),
+            0 if item[0].generation_mode == ASSET_MODE_PER_PHONEME else 1,
             str(item[0].audio_path),
         ),
     )
@@ -389,9 +474,20 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Path to a local JSON asset index. Defaults to blabber_asset_index.json beside this script.",
     )
     parser.add_argument(
+        "--asset-root",
+        default="",
+        help="Optional asset-root directory to scan when the asset index is missing.",
+    )
+    parser.add_argument(
         "--voice",
         required=True,
         help="Requested voice bank: female/woman or male/man.",
+    )
+    parser.add_argument(
+        "--generation-mode",
+        choices=ASSET_MODES,
+        default=ASSET_MODE_AUTO,
+        help="Limit selection to a specific output bank or search across all assets.",
     )
     parser.add_argument(
         "--word",
@@ -418,16 +514,21 @@ def main() -> int:
 
     comparison_path = _resolve_path(args.comparison_result, ROOT)
     asset_index_path = _resolve_path(args.asset_index, ROOT)
+    asset_root = _resolve_path(args.asset_root, ROOT) if args.asset_root.strip() else asset_index_path.parent
     requested_voice = normalize_voice_mode(args.voice)
 
     comparison = adapt_comparison_result(load_comparison_result(comparison_path))
-    candidates = load_asset_index(asset_index_path)
+    if asset_index_path.is_file():
+        candidates = load_asset_index(asset_index_path)
+    else:
+        candidates = scan_asset_root(asset_root)
     result = select_asset(
         comparison=comparison,
         candidates=candidates,
         requested_voice=requested_voice,
         target_word=args.word.strip() or None,
         target_label_id=args.label_id,
+        generation_mode=str(args.generation_mode),
     )
 
     output_json = json.dumps(result, indent=2)
