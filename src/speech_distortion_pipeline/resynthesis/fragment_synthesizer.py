@@ -5,9 +5,11 @@ import os
 import random
 import shutil
 import subprocess
+import sys
 import tempfile
 import wave
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Dict, List, Optional, Protocol, Tuple
 
 from speech_distortion_pipeline.models import AudioBuffer, AudioSegment, EditPlan, EditType, PhoneGraph, PhoneNode, TimingPlan
@@ -30,6 +32,21 @@ def resolve_conda_command() -> list[str]:
     if lowered.endswith(".bat") or lowered.endswith(".cmd"):
         return [os.environ.get("COMSPEC", "cmd.exe"), "/c", conda_path]
     return [conda_path]
+
+
+def resolve_python_command(target_conda_env_name: str | None = None) -> list[str]:
+    """Use the current interpreter when already inside the requested env, else fall back to conda run."""
+    current_prefix = Path(sys.prefix).name.strip().lower()
+    target_name = str(target_conda_env_name or "").strip().lower()
+    if target_name and current_prefix == target_name:
+        return [sys.executable]
+    current_env = os.environ.get("CONDA_DEFAULT_ENV", "").strip().lower()
+    if target_name and current_env == target_name:
+        return [sys.executable]
+    conda_command = resolve_conda_command()
+    if conda_command == ["conda"]:
+        return [sys.executable]
+    return conda_command + ["run", "-n", target_conda_env_name or current_env or "base", "python"]
 
 
 class FragmentSynthesizer(Protocol):
@@ -467,6 +484,7 @@ class CoquiFragmentSynthesizer:
     conda_env_name: str = "torch"
     model_name: str = "tts_models/en/ljspeech/tacotron2-DDC"
     speaker_wav_path: Optional[str] = None
+    speaker_name: Optional[str] = None
     use_gpu: bool = False
 
     def synthesize(
@@ -595,10 +613,11 @@ class CoquiFragmentSynthesizer:
             env["COQUI_MODEL"] = self.model_name
             env["COQUI_USE_GPU"] = "1" if self.use_gpu else "0"
             env["COQUI_SPEAKER_WAV"] = self.speaker_wav_path or ""
+            env["COQUI_SPEAKER"] = self.speaker_name or ""
             env["COQUI_PREPHONEMIZED"] = "1" if prephonemized else "0"
             env["COQUI_LANGUAGE"] = language or ""
             completed = subprocess.run(
-                resolve_conda_command() + ["run", "-n", self.conda_env_name, "python", script_path],
+                resolve_python_command(self.conda_env_name) + [script_path],
                 check=False,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
@@ -639,6 +658,7 @@ class CoquiFragmentSynthesizer:
             "model_name = os.environ['COQUI_MODEL']\n"
             "use_gpu = os.environ.get('COQUI_USE_GPU', '0') == '1'\n"
             "speaker_wav = os.environ.get('COQUI_SPEAKER_WAV') or None\n"
+            "speaker_name = os.environ.get('COQUI_SPEAKER') or None\n"
             "prephonemized = os.environ.get('COQUI_PREPHONEMIZED', '0') == '1'\n"
             "language = os.environ.get('COQUI_LANGUAGE') or None\n"
             "tts = TTS(model_name=model_name, progress_bar=False, gpu=use_gpu)\n"
@@ -654,6 +674,8 @@ class CoquiFragmentSynthesizer:
             "    tokenizer.phonemizer = IdentityPhonemizer()\n"
             "    tokenizer.text_cleaner = None\n"
             "kwargs = {'text': text, 'file_path': out_path}\n"
+            "if speaker_name:\n"
+            "    kwargs['speaker'] = speaker_name\n"
             "if speaker_wav:\n"
             "    kwargs['speaker_wav'] = speaker_wav\n"
             "if language:\n"

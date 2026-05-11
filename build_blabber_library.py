@@ -42,7 +42,23 @@ from speech_distortion_pipeline.phonology.phone_distance_reference import (
 from speech_distortion_pipeline.resynthesis.fragment_synthesizer import (
     CoquiFragmentSynthesizer,
     CoquiSynthesisError,
-    resolve_conda_command,
+    resolve_python_command,
+)
+from speech_distortion_pipeline.resynthesis.phoneme_render_backend import (
+    PHONEME_RENDER_BACKEND_COQUI_TACOTRON2_DDC_PH,
+    PHONEME_RENDER_BACKEND_FASTPITCH,
+    PHONEME_RENDER_BACKEND_KOKORO,
+    PHONEME_RENDER_BACKENDS,
+    backend_metadata,
+    default_woman_phoneme_render_backend,
+    probe_phoneme_render_backend,
+    render_with_phoneme_backend,
+)
+from speech_distortion_pipeline.resynthesis.style_transfer import (
+    DEFAULT_STYLE_TRANSFER_PRESETS_PATH,
+    STYLE_TRANSFER_BACKENDS,
+    STYLE_TRANSFER_BACKEND_NONE,
+    apply_style_transfer,
 )
 
 LIBRARY_BLABBER_VOICE_MODE = "woman"
@@ -331,15 +347,8 @@ def phones_to_clone_text(phones: Sequence[str]) -> str:
 
 def ensure_coqui_backend(env_name: str) -> None:
     completed = subprocess.run(
-        resolve_conda_command()
-        + [
-            "run",
-            "-n",
-            env_name,
-            "python",
-            "-c",
-            "import importlib.util; raise SystemExit(0 if importlib.util.find_spec('TTS') else 1)",
-        ],
+        resolve_python_command(env_name)
+        + ["-c", "import importlib.util; raise SystemExit(0 if importlib.util.find_spec('TTS') else 1)"],
         check=False,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
@@ -368,29 +377,47 @@ def render_blabber_sequence(
     audio: AudioBuffer,
     phones: Sequence[str],
     voice_mode: str,
-) -> tuple[np.ndarray, str]:
+) -> tuple[np.ndarray, str, dict[str, str]]:
     profile = resolve_blabber_voice_profile(voice_mode)
-    synthesizer = CoquiFragmentSynthesizer(
+    if profile.uses_source_speaker_wav or not profile.prephonemized or profile.input_encoding != "ipa":
+        synthesizer = CoquiFragmentSynthesizer(
+            conda_env_name=COQUI_ENV_NAME,
+            model_name=profile.model_name,
+            speaker_wav_path=resolve_source_speaker_wav_path(audio, True) if profile.uses_source_speaker_wav else None,
+        )
+        render_text = phones_to_clone_text(phones) if profile.input_encoding == "clone_text" else phones_to_ipa(phones)
+        rendered = synthesizer._render_with_coqui(
+            render_text,
+            audio.sample_rate_hz,
+            prephonemized=profile.prephonemized,
+            language=profile.language,
+        )
+        if not rendered:
+            raise RuntimeError(f"Coqui synthesis produced no audio in conda env '{COQUI_ENV_NAME}'.")
+        return np.asarray(rendered, dtype=np.float32), profile.model_name, {
+            "phoneme_render_backend": "coqui_voice_profile_direct",
+            "phoneme_render_model_name": profile.model_name,
+            "phoneme_render_input_encoding": profile.input_encoding,
+            "phoneme_render_prephonemized": "1" if profile.prephonemized else "0",
+        }
+
+    result = render_with_phoneme_backend(
+        audio,
+        phones,
+        backend=default_woman_phoneme_render_backend(),
         conda_env_name=COQUI_ENV_NAME,
-        model_name=profile.model_name,
-        speaker_wav_path=resolve_source_speaker_wav_path(audio, True) if profile.uses_source_speaker_wav else None,
     )
-    render_text = phones_to_clone_text(phones) if profile.input_encoding == "clone_text" else phones_to_ipa(phones)
-    rendered = synthesizer._render_with_coqui(
-        render_text,
-        audio.sample_rate_hz,
-        prephonemized=profile.prephonemized,
-        language=profile.language,
-    )
-    if not rendered:
-        raise RuntimeError(f"Coqui synthesis produced no audio in conda env '{COQUI_ENV_NAME}'.")
-    return np.asarray(rendered, dtype=np.float32), profile.model_name
+    return np.asarray(result.samples, dtype=np.float32), result.model_name, backend_metadata(result)
 
 
 def render_blabber_per_phoneme(
     audio: AudioBuffer,
     transcript: str,
     phoneme_qualities: Sequence[float],
+    phoneme_render_backend: str = PHONEME_RENDER_BACKEND_COQUI_TACOTRON2_DDC_PH,
+    style_transfer_backend: str = STYLE_TRANSFER_BACKEND_NONE,
+    style_transfer_target_voice: str = "",
+    style_transfer_presets_path: str | Path | None = None,
 ) -> tuple[AudioBuffer, list[str], list[str]]:
     cleaned = transcript.strip()
     if not cleaned:
@@ -418,9 +445,24 @@ def render_blabber_per_phoneme(
         per_phone_numeric_entries_used,
     ) = build_per_phoneme_blabber_sequence(source_phones, phoneme_qualities)
     try:
-        output, coqui_model_name = render_blabber_sequence(audio, mutated_phones, LIBRARY_BLABBER_VOICE_MODE)
-    except CoquiSynthesisError as exc:
-        raise RuntimeError(f"Coqui synthesis failed in conda env '{COQUI_ENV_NAME}'.\n\n{exc}") from exc
+        if phoneme_render_backend == PHONEME_RENDER_BACKEND_COQUI_TACOTRON2_DDC_PH:
+            output, coqui_model_name, render_backend_meta = render_blabber_sequence(
+                audio,
+                mutated_phones,
+                LIBRARY_BLABBER_VOICE_MODE,
+            )
+        else:
+            result = render_with_phoneme_backend(
+                audio,
+                mutated_phones,
+                backend=phoneme_render_backend,
+                conda_env_name=COQUI_ENV_NAME,
+            )
+            output = np.asarray(result.samples, dtype=np.float32)
+            coqui_model_name = result.model_name
+            render_backend_meta = backend_metadata(result)
+    except (CoquiSynthesisError, RuntimeError) as exc:
+        raise RuntimeError(f"Phoneme render failed in conda env '{COQUI_ENV_NAME}'.\n\n{exc}") from exc
     rendered_audio = from_numpy(
         output,
         audio,
@@ -444,6 +486,15 @@ def render_blabber_per_phoneme(
         style_transfer_backend="none",
         style_transfer_target_voice="",
         style_transfer_status="not_requested",
+        **render_backend_meta,
+    )
+    rendered_audio = apply_style_transfer(
+        rendered_audio,
+        style_transfer_backend,
+        target_voice=style_transfer_target_voice,
+        presets_path=style_transfer_presets_path,
+        conda_env_name=COQUI_ENV_NAME,
+        base_voice_mode=LIBRARY_BLABBER_VOICE_MODE,
     )
     return rendered_audio, source_phones, mutated_phones
 
@@ -453,6 +504,10 @@ def render_blabber_global(
     transcript: str,
     quality: float,
     max_phoneme_distance: float | None = None,
+    phoneme_render_backend: str = PHONEME_RENDER_BACKEND_COQUI_TACOTRON2_DDC_PH,
+    style_transfer_backend: str = STYLE_TRANSFER_BACKEND_NONE,
+    style_transfer_target_voice: str = "",
+    style_transfer_presets_path: str | Path | None = None,
 ) -> tuple[AudioBuffer, list[str], list[str], int, bool, float]:
     cleaned, source_phones, mutated_phones, preset_index, expansion_used, total_distance = resolve_global_blabber_phone_sequence(
         transcript,
@@ -460,9 +515,24 @@ def render_blabber_global(
         max_phoneme_distance=max_phoneme_distance,
     )
     try:
-        output, coqui_model_name = render_blabber_sequence(audio, mutated_phones, LIBRARY_BLABBER_VOICE_MODE)
-    except CoquiSynthesisError as exc:
-        raise RuntimeError(f"Coqui synthesis failed in conda env '{COQUI_ENV_NAME}'.\n\n{exc}") from exc
+        if phoneme_render_backend == PHONEME_RENDER_BACKEND_COQUI_TACOTRON2_DDC_PH:
+            output, coqui_model_name, render_backend_meta = render_blabber_sequence(
+                audio,
+                mutated_phones,
+                LIBRARY_BLABBER_VOICE_MODE,
+            )
+        else:
+            result = render_with_phoneme_backend(
+                audio,
+                mutated_phones,
+                backend=phoneme_render_backend,
+                conda_env_name=COQUI_ENV_NAME,
+            )
+            output = np.asarray(result.samples, dtype=np.float32)
+            coqui_model_name = result.model_name
+            render_backend_meta = backend_metadata(result)
+    except (CoquiSynthesisError, RuntimeError) as exc:
+        raise RuntimeError(f"Phoneme render failed in conda env '{COQUI_ENV_NAME}'.\n\n{exc}") from exc
     metadata = {
         "augmentation": "blabber",
         "quality": f"{quality:.3f}",
@@ -481,9 +551,18 @@ def render_blabber_global(
         "style_transfer_target_voice": "",
         "style_transfer_status": "not_requested",
     }
+    metadata.update(render_backend_meta)
     if max_phoneme_distance is not None:
         metadata["global_max_phoneme_distance"] = f"{max_phoneme_distance:.3f}"
     rendered_audio = from_numpy(output, audio, **metadata)
+    rendered_audio = apply_style_transfer(
+        rendered_audio,
+        style_transfer_backend,
+        target_voice=style_transfer_target_voice,
+        presets_path=style_transfer_presets_path,
+        conda_env_name=COQUI_ENV_NAME,
+        base_voice_mode=LIBRARY_BLABBER_VOICE_MODE,
+    )
     return rendered_audio, source_phones, mutated_phones, preset_index, expansion_used, total_distance
 
 
@@ -601,7 +680,10 @@ def build_sidecar_payload(
             "backend": rendered_audio.metadata.get("style_transfer_backend", "none"),
             "target_voice": rendered_audio.metadata.get("style_transfer_target_voice", ""),
             "status": rendered_audio.metadata.get("style_transfer_status", "not_requested"),
-            "base_voice_mode": rendered_audio.metadata.get("voice_mode", LIBRARY_BLABBER_VOICE_MODE),
+            "base_voice_mode": rendered_audio.metadata.get(
+                "style_transfer_base_voice_mode",
+                rendered_audio.metadata.get("voice_mode", LIBRARY_BLABBER_VOICE_MODE),
+            ),
         },
         "metadata": dict(rendered_audio.metadata),
     }
@@ -647,6 +729,10 @@ def process_entry(
     writer: WavAudioWriter,
     generation_mode: str,
     global_max_phoneme_distance: float | None = None,
+    phoneme_render_backend: str = PHONEME_RENDER_BACKEND_COQUI_TACOTRON2_DDC_PH,
+    style_transfer_backend: str = STYLE_TRANSFER_BACKEND_NONE,
+    style_transfer_target_voice: str = "",
+    style_transfer_presets_path: str | Path | None = None,
 ) -> dict[str, Any]:
     if not entry.audio_path.exists():
         raise FileNotFoundError(f"Input audio file does not exist: {entry.audio_path}")
@@ -675,6 +761,10 @@ def process_entry(
                 entry.transcript,
                 quality,
                 max_phoneme_distance=global_max_phoneme_distance,
+                phoneme_render_backend=phoneme_render_backend,
+                style_transfer_backend=style_transfer_backend,
+                style_transfer_target_voice=style_transfer_target_voice,
+                style_transfer_presets_path=style_transfer_presets_path,
             )
 
             output_audio_path = output_dir / (
@@ -713,6 +803,10 @@ def process_entry(
                     "expansion_used": expansion_used,
                     "global_distance_total": total_distance,
                     "global_max_phoneme_distance": global_max_phoneme_distance,
+                    "style_transfer_backend": rendered_audio.metadata.get("style_transfer_backend", "none"),
+                    "style_transfer_target_voice": rendered_audio.metadata.get("style_transfer_target_voice", ""),
+                    "phoneme_render_backend": rendered_audio.metadata.get("phoneme_render_backend", ""),
+                    "phoneme_render_model_name": rendered_audio.metadata.get("phoneme_render_model_name", ""),
                 }
             )
     else:
@@ -721,6 +815,10 @@ def process_entry(
                 audio,
                 entry.transcript,
                 phoneme_values,
+                phoneme_render_backend=phoneme_render_backend,
+                style_transfer_backend=style_transfer_backend,
+                style_transfer_target_voice=style_transfer_target_voice,
+                style_transfer_presets_path=style_transfer_presets_path,
             )
 
             quality_suffix = "_".join(format_quality_token(value) for value in phoneme_values)
@@ -755,6 +853,10 @@ def process_entry(
                     "voice_mode": rendered_audio.metadata.get("voice_mode", LIBRARY_BLABBER_VOICE_MODE),
                     "phoneme_values": phoneme_values,
                     "whole_word_distance_total": float(rendered_audio.metadata["whole_word_distance_total"]),
+                    "style_transfer_backend": rendered_audio.metadata.get("style_transfer_backend", "none"),
+                    "style_transfer_target_voice": rendered_audio.metadata.get("style_transfer_target_voice", ""),
+                    "phoneme_render_backend": rendered_audio.metadata.get("phoneme_render_backend", ""),
+                    "phoneme_render_model_name": rendered_audio.metadata.get("phoneme_render_model_name", ""),
                 }
             )
 
@@ -803,6 +905,33 @@ def build_arg_parser() -> argparse.ArgumentParser:
             "Individual candidates above this distance are excluded."
         ),
     )
+    parser.add_argument(
+        "--phoneme-render-backend",
+        choices=PHONEME_RENDER_BACKENDS,
+        default=default_woman_phoneme_render_backend(),
+        help="Direct phoneme render backend for woman Blabber generation.",
+    )
+    parser.add_argument(
+        "--style-transfer-backend",
+        choices=STYLE_TRANSFER_BACKENDS,
+        default=STYLE_TRANSFER_BACKEND_NONE,
+        help="Optional post-render style transfer backend to apply after the woman Blabber render.",
+    )
+    parser.add_argument(
+        "--style-transfer-target-voice",
+        default="",
+        help="Named target voice preset from the style transfer preset manifest.",
+    )
+    parser.add_argument(
+        "--style-transfer-presets",
+        default=str(DEFAULT_STYLE_TRANSFER_PRESETS_PATH),
+        help="Path to the JSON style transfer preset manifest.",
+    )
+    parser.add_argument(
+        "--print-backend-probes",
+        action="store_true",
+        help="Print phoneme-render backend compatibility probes as JSON and exit.",
+    )
     return parser
 
 
@@ -815,6 +944,23 @@ def main() -> int:
     output_dir.mkdir(parents=True, exist_ok=True)
 
     ensure_coqui_backend(COQUI_ENV_NAME)
+    if args.print_backend_probes:
+        probes = [
+            {
+                "backend": probe.backend,
+                "ok": probe.ok,
+                "status": probe.status,
+                "detail": probe.detail,
+                "model_name": probe.model_name,
+            }
+            for probe in (
+                probe_phoneme_render_backend(PHONEME_RENDER_BACKEND_COQUI_TACOTRON2_DDC_PH, COQUI_ENV_NAME),
+                probe_phoneme_render_backend(PHONEME_RENDER_BACKEND_FASTPITCH, COQUI_ENV_NAME),
+                probe_phoneme_render_backend(PHONEME_RENDER_BACKEND_KOKORO, COQUI_ENV_NAME),
+            )
+        ]
+        print(json.dumps(probes, indent=2))
+        return 0
     entries = load_manifest(manifest_path)
     if not entries:
         raise ValueError("Manifest did not contain any entries.")
@@ -834,6 +980,10 @@ def main() -> int:
                 if args.global_max_phoneme_distance is not None
                 else None
             ),
+            phoneme_render_backend=str(args.phoneme_render_backend),
+            style_transfer_backend=str(args.style_transfer_backend),
+            style_transfer_target_voice=str(args.style_transfer_target_voice),
+            style_transfer_presets_path=Path(args.style_transfer_presets).resolve(),
         )
         for entry in entries
     ]

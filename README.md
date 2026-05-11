@@ -57,6 +57,125 @@ $env:BLABBER_COQUI_CLONE_MODEL="tts_models/multilingual/multi-dataset/xtts_v2"
 `BLABBER_COQUI_MODEL` is still accepted as a backward-compatible alias for the woman preset when
 `BLABBER_COQUI_WOMAN_MODEL` is not set.
 
+## Model Downloads
+
+There are two different model sources used by this repo:
+
+- the Apple ACN embedder used by `src/speech_distortion_pipeline/phonology/acn_neighbors.py`
+- the Coqui TTS and voice-conversion models referenced by the `BLABBER_COQUI_*` environment variables above
+
+### ACN Embedder Model
+
+`acn_neighbors.py` expects the Apple Acoustic Neighbor Embeddings text embedder model to be available locally.
+
+Download source:
+
+- Apple research page: <https://machinelearning.apple.com/research/acoustic-neighbor-embeddings>
+- Apple model/package repo: <https://github.com/apple/ml-acn-embed>
+
+What to download:
+
+- the pretrained ACN archive `model.tgz`
+
+Where to put it:
+
+- option 1: place `model.tgz` in the repo root, so the code can auto-extract it on first use
+- option 2: extract it yourself so the model directory exists at `model/embedder-64/`
+- option 3: store it somewhere else and set `ACN_EMBED_MODEL_DIR` to that extracted `embedder-64` directory
+
+Expected local layouts:
+
+```text
+speech-distortion/
+  model.tgz
+```
+
+or
+
+```text
+speech-distortion/
+  model/
+    embedder-64/
+```
+
+Example override:
+
+```powershell
+$env:ACN_EMBED_MODEL_DIR="D:\models\acn\embedder-64"
+```
+
+### Coqui TTS Models
+
+The Coqui model values in `BLABBER_COQUI_WOMAN_MODEL`, `BLABBER_COQUI_MAN_MODEL`, and
+`BLABBER_COQUI_CLONE_MODEL` are model IDs, not repo-local files. With `coqui-tts` installed, Coqui
+downloads those models into its own cache the first time they are used.
+
+Default model IDs used by this repo:
+
+- `tts_models/en/ljspeech/tacotron2-DDC_ph` for the `woman` preset
+- `tts_models/en/vctk/vits` for the `man` preset
+- `tts_models/multilingual/multi-dataset/xtts_v2` for `source_clone`
+
+For woman-to-male post-render style transfer, the repo now also supports the Coqui voice-conversion model:
+
+- `voice_conversion_models/multilingual/multi-dataset/openvoice_v2`
+
+Experimental direct phoneme render backends are controlled separately:
+
+```powershell
+$env:BLABBER_PHONEME_VITS_MODEL="your phoneme-trained Coqui VITS checkpoint"
+$env:BLABBER_FASTPITCH_MODEL="nvidia/tts_en_fastpitch"
+$env:BLABBER_FASTPITCH_HIFIGAN_MODEL="nvidia/tts_hifigan"
+$env:BLABBER_KOKORO_MODEL="hexgrad/Kokoro-82M"
+$env:BLABBER_KOKORO_VOICE="bf_emma"
+```
+
+Notes:
+
+- `BLABBER_PHONEME_VITS_MODEL` must point to a phoneme-trained Coqui VITS model, not a generic text-first VITS checkpoint
+- `fastpitch` now uses NeMo directly when `nemo_toolkit` is installed
+- the default FastPitch pair is `nvidia/tts_en_fastpitch` plus `nvidia/tts_hifigan`
+- FastPitch currently renders from phoneme-derived surrogate text, not raw IPA tokens
+- `BLABBER_FASTPITCH_RENDERER` is still accepted as an escape hatch for a custom external adapter if needed
+- `kokoro` uses the `kokoro` Python package with `KPipeline`, not Coqui
+- the current Kokoro GUI voices are `bf_emma` and `gm_fable`; `gm_fable` is a GUI alias that maps to Kokoro's published `bm_fable` voice ID
+- Kokoro follows the published pronunciation-markup path like `[text](/ipa/)`, so install `kokoro`, `soundfile`, and the English fallback dependency `espeak-ng` in the runtime that launches the GUI or builder
+
+## Style Transfer Presets
+
+Woman-to-male style transfer is configured through:
+
+- `config/style_transfer_presets.json`
+
+This file defines named target voice presets for post-render conversion. The GUI and
+`build_blabber_library.py` both read the same manifest.
+
+Expected shape:
+
+```json
+{
+  "presets": [
+    {
+      "name": "male_demo",
+      "display_name": "Male Demo",
+      "target_gender": "male",
+      "target_wavs": [
+        "reference-voices/male_demo_01.wav",
+        "reference-voices/male_demo_02.wav"
+      ],
+      "description": "Optional note shown only in the config."
+    }
+  ]
+}
+```
+
+Notes:
+
+- `target_wavs` can contain one or more local male reference WAVs
+- relative paths are resolved relative to `config/style_transfer_presets.json`
+- the checked-in file currently starts empty, so add your own presets before using the backend
+- the current post-render backend supports only woman-to-male conversion presets
+
 ## Run The GUI
 
 ```powershell
@@ -87,6 +206,9 @@ The default demo input is `yes_slow.wav` when present in the repo root.
 - requires a single-word transcript
 - uses heuristic G2P to derive the source phoneme sequence
 - supports preset `woman` and `man` TTS outputs plus optional source voice cloning through Coqui `speaker_wav`
+- supports optional post-render woman-to-male style transfer through named presets in `config/style_transfer_presets.json`
+- supports experimental woman-path phoneme backends `coqui_tacotron2_ddc_ph`, `fastpitch`, and `kokoro`
+- when `Phoneme TTS = kokoro`, the GUI enables a backend-specific `Kokoro voice` selector for `bf_emma` or `gm_fable`
 - provides a `Generate Sequence` button to preview the resolved phone sequence before rendering
 - caches the generated sequence and reuses it for the next render when inputs have not changed
 
@@ -127,8 +249,8 @@ The default demo input is `yes_slow.wav` when present in the repo root.
 ## Standalone Blabber Library Builder
 
 `build_blabber_library.py` generates standalone Blabber assets from a manifest of input WAVs and single-word transcripts.
-The builder currently renders only the female/woman preset voice. A later male voice path is expected to be
-implemented as a post-process style-transfer stage on the generated audio, not as a second direct TTS render mode.
+The builder renders the female/woman preset voice first and can now optionally apply a post-process woman-to-male
+style-transfer stage on the generated audio.
 For `global_soft` generation, `--global-max-phoneme-distance` applies the same per-phone distance cap as the GUI.
 
 Supported manifest formats:
@@ -155,16 +277,18 @@ Example runs:
 
 ```powershell
 python build_blabber_library.py --manifest blabber_manifest.csv --output-dir speech-assets
+python build_blabber_library.py --manifest blabber_manifest.csv --output-dir speech-assets --style-transfer-backend openvoice_v2 --style-transfer-target-voice male_demo
 ```
 
 Current behavior:
 
 - default generation mode is `global_soft`, which now means deterministic global distance progression
+- default direct phoneme render backend is `coqui_tacotron2_ddc_ph`
 - global generation produces `GLOBAL_BLABBER_PRESET_COUNT` ordered outputs per word
 - per-phoneme deterministic ladders use `PER_PHONEME_BLABBER_PRESET_COUNT`
 - per-phoneme generation remains available as the original combinatorial mode
 - generated Blabber metadata includes global or per-phone distance information depending on generation mode
-- generated Blabber metadata now also includes `voice_mode`, `coqui_model_name`, and a `style_transfer` placeholder block
+- generated Blabber metadata now also includes `voice_mode`, `coqui_model_name`, and style-transfer status fields
 - each generated asset also writes a `.json` sidecar with:
   - `phoneme_values`
   - `source_phonemes`
@@ -178,7 +302,49 @@ Notes:
 - `phoneme_count` must exactly match the detected source phoneme count for that word
 - Coqui must be installed in the configured `BLABBER_CONDA_ENV`
 - the builder currently uses only the configured woman preset model
-- sidecar JSON includes `style_transfer.backend/status/target_voice` so a later male voice-conversion stage can be added after female Blabber generation
+- `--phoneme-render-backend` can be used to try `coqui_tacotron2_ddc_ph`, `fastpitch`, `kokoro`, or `phoneme_vits`
+- `--style-transfer-backend openvoice_v2` applies Coqui OpenVoice v2 after the woman render
+- `--style-transfer-target-voice` must match a preset name from `config/style_transfer_presets.json`
+
+## Phoneme Render Backend Comparison
+
+The current production baseline is:
+
+- `coqui_tacotron2_ddc_ph`
+
+Two experimental direct-phoneme comparison backends are exposed:
+
+- `phoneme_vits`
+- `fastpitch`
+- `kokoro`
+
+Quick probe:
+
+```powershell
+python build_blabber_library.py --manifest blabber_manifest.csv --print-backend-probes
+```
+
+Run the comparison harness:
+
+```powershell
+python compare_phoneme_render_backends.py `
+  --manifest blabber_manifest.csv `
+  --generation-mode global_soft `
+  --output-root comparison-assets
+```
+
+The comparison script:
+
+- probes each backend for compatibility or configuration status
+- runs the same manifest through each available backend
+- prints JSON with probe results, generated outputs, and per-entry failures
+
+Experimental backend constraints:
+
+- `phoneme_vits` requires `BLABBER_PHONEME_VITS_MODEL`
+- `fastpitch` requires `nemo_toolkit` plus the NVIDIA FastPitch and HiFiGAN checkpoints
+- `kokoro` requires the `kokoro` package, `soundfile`, and the English fallback dependency `espeak-ng`
+- the GUI now exposes `kokoro` directly on the woman phoneme path with a dedicated Kokoro voice selector
 
 ## Blabber Asset Selection From Template Mismatch
 
@@ -280,6 +446,7 @@ Notes:
 - Phoneme identities come from heuristic transcript-based G2P, not a production lexicon.
 - Signal-domain phoneme segmentation is estimated from the waveform and transcript, not a full phoneme forced aligner.
 - `blabber` depends on a phoneme-capable Coqui model; incompatible TTS environments will fail at render time.
+- experimental direct phoneme backend comparison does not change the default production woman render path
 - Deterministic distance progression is only as good as the exported `phoneme_distances.json` reference.
 - Some demo `.wav` files are kept in the repo for quick testing. Generated outputs and caches are ignored by `.gitignore`.
 

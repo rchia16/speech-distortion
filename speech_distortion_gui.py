@@ -50,13 +50,43 @@ from speech_distortion_pipeline.phonology.phone_distance_reference import (
 from speech_distortion_pipeline.resynthesis.fragment_synthesizer import (
     CoquiFragmentSynthesizer,
     CoquiSynthesisError,
-    resolve_conda_command,
+    resolve_python_command,
+)
+from speech_distortion_pipeline.resynthesis.phoneme_render_backend import (
+    DEFAULT_KOKORO_VOICE,
+    KOKORO_VOICE_OPTIONS,
+    PHONEME_RENDER_BACKENDS,
+    PHONEME_RENDER_BACKEND_COQUI_TACOTRON2_DDC_PH,
+    PHONEME_RENDER_BACKEND_KOKORO,
+    PhonemeRenderError,
+    backend_metadata,
+    default_woman_phoneme_render_backend,
+    render_with_phoneme_backend,
+)
+from speech_distortion_pipeline.resynthesis.style_transfer import (
+    DEFAULT_STYLE_TRANSFER_PRESETS_PATH,
+    STYLE_TRANSFER_BACKENDS,
+    STYLE_TRANSFER_BACKEND_NONE,
+    apply_style_transfer,
+    male_style_transfer_presets,
 )
 DEFAULT_INPUT = ROOT / DEFAULT_GUI_INPUT_FILENAME
 MAX_DROPOUT_FRACTION = 0.8
 MAX_DROPOUT_SILENCE_MS = 200.0
 GLOBAL_BLABBER_MAX_PHONEME_DISTANCE_VALUES = tuple(f"{value / 10.0:.1f}" for value in range(8, 101))
 DEFAULT_GLOBAL_BLABBER_MAX_PHONEME_DISTANCE = "4.0"
+DEFAULT_MALE_COQUI_SPEAKER = "p226"
+MALE_COQUI_SPEAKER_OPTIONS = (
+    "p226",
+    "p227",
+    "p232",
+    "p243",
+    "p256",
+    "p270",
+    "p287",
+)
+DEFAULT_STYLE_TRANSFER_BACKEND = STYLE_TRANSFER_BACKEND_NONE
+DEFAULT_PHONEME_RENDER_BACKEND = default_woman_phoneme_render_backend()
 
 
 PHONE_CLASS_WEIGHTS: dict[str, float] = {
@@ -770,23 +800,50 @@ def render_blabber_sequence(
     audio: AudioBuffer,
     phones: Sequence[str],
     voice_mode: str,
-) -> tuple[np.ndarray, str]:
+    speaker_name: str | None = None,
+    phoneme_render_backend: str = PHONEME_RENDER_BACKEND_COQUI_TACOTRON2_DDC_PH,
+    backend_voice: str | None = None,
+) -> tuple[np.ndarray, str, dict[str, str]]:
     profile = resolve_blabber_voice_profile(voice_mode)
-    synthesizer = CoquiFragmentSynthesizer(
-        conda_env_name=COQUI_ENV_NAME,
-        model_name=profile.model_name,
-        speaker_wav_path=resolve_source_speaker_wav_path(audio, True) if profile.uses_source_speaker_wav else None,
-    )
-    render_text = phones_to_clone_text(phones) if profile.input_encoding == "clone_text" else phones_to_ipa(phones)
-    rendered = synthesizer._render_with_coqui(
-        render_text,
-        audio.sample_rate_hz,
-        prephonemized=profile.prephonemized,
-        language=profile.language,
-    )
-    if not rendered:
-        raise RuntimeError(f"Coqui synthesis produced no audio in conda env '{COQUI_ENV_NAME}'.")
-    return np.asarray(rendered, dtype=np.float32), profile.model_name
+    if (
+        profile.uses_source_speaker_wav
+        or speaker_name
+        or not profile.prephonemized
+        or profile.input_encoding != "ipa"
+    ):
+        synthesizer = CoquiFragmentSynthesizer(
+            conda_env_name=COQUI_ENV_NAME,
+            model_name=profile.model_name,
+            speaker_wav_path=resolve_source_speaker_wav_path(audio, True) if profile.uses_source_speaker_wav else None,
+            speaker_name=speaker_name,
+        )
+        render_text = phones_to_clone_text(phones) if profile.input_encoding == "clone_text" else phones_to_ipa(phones)
+        rendered = synthesizer._render_with_coqui(
+            render_text,
+            audio.sample_rate_hz,
+            prephonemized=profile.prephonemized,
+            language=profile.language,
+        )
+        if not rendered:
+            raise RuntimeError(f"Coqui synthesis produced no audio in conda env '{COQUI_ENV_NAME}'.")
+        return np.asarray(rendered, dtype=np.float32), profile.model_name, {
+            "phoneme_render_backend": "coqui_voice_profile_direct",
+            "phoneme_render_model_name": profile.model_name,
+            "phoneme_render_input_encoding": profile.input_encoding,
+            "phoneme_render_prephonemized": "1" if profile.prephonemized else "0",
+        }
+
+    try:
+        result = render_with_phoneme_backend(
+            audio,
+            phones,
+            backend=phoneme_render_backend,
+            conda_env_name=COQUI_ENV_NAME,
+            backend_voice=backend_voice,
+        )
+    except PhonemeRenderError as exc:
+        raise RuntimeError(f"Phoneme render backend failed in conda env '{COQUI_ENV_NAME}'.\n\n{exc}") from exc
+    return np.asarray(result.samples, dtype=np.float32), result.model_name, backend_metadata(result)
 
 
 def mutate_phone(phone: str, severity: float) -> str:
@@ -913,6 +970,9 @@ def render_blabber_from_resolved_phones(
     source_phones: Sequence[str],
     mutated_phones: Sequence[str],
     voice_mode: str = "woman",
+    speaker_name: str | None = None,
+    phoneme_render_backend: str = PHONEME_RENDER_BACKEND_COQUI_TACOTRON2_DDC_PH,
+    backend_voice: str | None = None,
     quality: float | None = None,
     phoneme_qualities: Sequence[float] | None = None,
     segmentation: str | None = None,
@@ -931,7 +991,17 @@ def render_blabber_from_resolved_phones(
 
     try:
         normalized_voice_mode = normalize_blabber_voice_mode(voice_mode)
-        output, coqui_model_name = render_blabber_sequence(audio, mutated_phones, normalized_voice_mode)
+        resolved_speaker_name = speaker_name.strip() if speaker_name else None
+        if normalized_voice_mode != "man":
+            resolved_speaker_name = None
+        output, coqui_model_name, render_backend_meta = render_blabber_sequence(
+            audio,
+            mutated_phones,
+            normalized_voice_mode,
+            speaker_name=resolved_speaker_name,
+            phoneme_render_backend=phoneme_render_backend,
+            backend_voice=backend_voice,
+        )
     except CoquiSynthesisError as exc:
         raise RuntimeError(f"Coqui synthesis failed in conda env '{COQUI_ENV_NAME}'.\n\n{exc}") from exc
 
@@ -949,6 +1019,9 @@ def render_blabber_from_resolved_phones(
         "coqui_model_name": coqui_model_name,
         "source_speaker_wav": "1" if normalized_voice_mode == "source_clone" else "0",
     }
+    metadata.update(render_backend_meta)
+    if resolved_speaker_name:
+        metadata["coqui_speaker"] = resolved_speaker_name
     if quality is not None:
         metadata["quality"] = f"{quality:.3f}"
     if phoneme_qualities is not None:
@@ -1048,6 +1121,9 @@ def render_blabber(
     quality: float,
     phoneme_qualities: Sequence[float] | None = None,
     voice_mode: str = "woman",
+    speaker_name: str | None = None,
+    phoneme_render_backend: str = PHONEME_RENDER_BACKEND_COQUI_TACOTRON2_DDC_PH,
+    backend_voice: str | None = None,
     max_phoneme_distance: float | None = None,
 ) -> AudioBuffer:
     ensure_coqui_backend(COQUI_ENV_NAME)
@@ -1074,6 +1150,9 @@ def render_blabber(
         source_phones,
         substituted_phones,
         voice_mode=voice_mode,
+        speaker_name=speaker_name,
+        phoneme_render_backend=phoneme_render_backend,
+        backend_voice=backend_voice,
         quality=quality,
         global_preset_index=preset_index,
         expansion_used=expansion_used,
@@ -1091,6 +1170,9 @@ def render_blabber_per_phoneme(
     transcript: str,
     phoneme_qualities: Sequence[float],
     voice_mode: str = "woman",
+    speaker_name: str | None = None,
+    phoneme_render_backend: str = PHONEME_RENDER_BACKEND_COQUI_TACOTRON2_DDC_PH,
+    backend_voice: str | None = None,
 ) -> AudioBuffer:
     ensure_coqui_backend(COQUI_ENV_NAME)
     (
@@ -1115,6 +1197,9 @@ def render_blabber_per_phoneme(
         source_phones,
         mutated_phones,
         voice_mode=voice_mode,
+        speaker_name=speaker_name,
+        phoneme_render_backend=phoneme_render_backend,
+        backend_voice=backend_voice,
         phoneme_qualities=phoneme_qualities,
         segmentation="phonetic",
         per_phone_preset_indices=per_phone_preset_indices,
@@ -1131,6 +1216,9 @@ def render_blabber_with_segments(
     breakpoints_str: str,
     phoneme_qualities: Sequence[float] | None = None,
     voice_mode: str = "woman",
+    speaker_name: str | None = None,
+    phoneme_render_backend: str = PHONEME_RENDER_BACKEND_COQUI_TACOTRON2_DDC_PH,
+    backend_voice: str | None = None,
     max_phoneme_distance: float | None = None,
 ) -> AudioBuffer:
     blabber = render_blabber(
@@ -1139,6 +1227,9 @@ def render_blabber_with_segments(
         quality,
         phoneme_qualities,
         voice_mode=voice_mode,
+        speaker_name=speaker_name,
+        phoneme_render_backend=phoneme_render_backend,
+        backend_voice=backend_voice,
         max_phoneme_distance=max_phoneme_distance,
     )
     source_phones = blabber.metadata.get("source_phones", "").split("-") if blabber.metadata.get("source_phones") else []
@@ -1165,15 +1256,8 @@ def render_blabber_with_segments(
 
 def ensure_coqui_backend(env_name: str) -> None:
     completed = subprocess.run(
-        resolve_conda_command()
-        + [
-            "run",
-            "-n",
-            env_name,
-            "python",
-            "-c",
-            "import importlib.util; raise SystemExit(0 if importlib.util.find_spec('TTS') else 1)",
-        ],
+        resolve_python_command(env_name)
+        + ["-c", "import importlib.util; raise SystemExit(0 if importlib.util.find_spec('TTS') else 1)"],
         check=False,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
@@ -1227,6 +1311,13 @@ class SpeechDistortionGui:
         self.transcript_var = tk.StringVar(value="bath")
         self.breakpoints_var = tk.StringVar(value="auto")
         self.voice_mode_var = tk.StringVar(value="woman")
+        self.male_speaker_var = tk.StringVar(value=DEFAULT_MALE_COQUI_SPEAKER)
+        self.phoneme_render_backend_var = tk.StringVar(value=DEFAULT_PHONEME_RENDER_BACKEND)
+        self.kokoro_voice_var = tk.StringVar(value=DEFAULT_KOKORO_VOICE)
+        self.style_transfer_backend_var = tk.StringVar(value=DEFAULT_STYLE_TRANSFER_BACKEND)
+        self.style_transfer_target_voice_var = tk.StringVar(value="")
+        self.style_transfer_presets_path = DEFAULT_STYLE_TRANSFER_PRESETS_PATH
+        self.style_transfer_preset_names: list[str] = []
         self.status_var = tk.StringVar(value="Choose a WAV file and render an augmentation.")
         self.subtitle_var = tk.StringVar(value=subtitle_text_for_mode(self.mode_var.get()))
         self.slider_label_var = tk.StringVar(value=slider_caption_for_mode(self.mode_var.get()))
@@ -1237,7 +1328,13 @@ class SpeechDistortionGui:
         self.mode_var.trace_add("write", self._on_mode_changed)
         self.quality_mode_var.trace_add("write", self._on_blabber_inputs_changed)
         self.max_phoneme_distance_var.trace_add("write", self._on_blabber_inputs_changed)
-        self.voice_mode_var.trace_add("write", self._on_blabber_inputs_changed)
+        self.voice_mode_var.trace_add("write", self._on_voice_mode_changed)
+        self.male_speaker_var.trace_add("write", self._on_blabber_inputs_changed)
+        self.phoneme_render_backend_var.trace_add("write", self._on_blabber_inputs_changed)
+        self.kokoro_voice_var.trace_add("write", self._on_blabber_inputs_changed)
+        self.style_transfer_backend_var.trace_add("write", self._on_style_transfer_backend_changed)
+        self.style_transfer_target_voice_var.trace_add("write", self._on_blabber_inputs_changed)
+        self._refresh_style_transfer_presets()
         if self.audio_path_var.get():
             self._load_audio(Path(self.audio_path_var.get()))
         self._refresh_phoneme_controls()
@@ -1330,6 +1427,61 @@ class SpeechDistortionGui:
             state="readonly",
         )
         self.voice_mode_combo.pack(side=tk.LEFT, fill=tk.X, expand=True)
+
+        male_speaker_row = ttk.Frame(container)
+        male_speaker_row.pack(fill=tk.X, pady=(12, 0))
+        ttk.Label(male_speaker_row, text="Male speaker", width=14).pack(side=tk.LEFT)
+        self.male_speaker_combo = ttk.Combobox(
+            male_speaker_row,
+            textvariable=self.male_speaker_var,
+            values=MALE_COQUI_SPEAKER_OPTIONS,
+            state="readonly",
+        )
+        self.male_speaker_combo.pack(side=tk.LEFT, fill=tk.X, expand=True)
+
+        phoneme_render_backend_row = ttk.Frame(container)
+        phoneme_render_backend_row.pack(fill=tk.X, pady=(12, 0))
+        ttk.Label(phoneme_render_backend_row, text="Phoneme TTS", width=14).pack(side=tk.LEFT)
+        self.phoneme_render_backend_combo = ttk.Combobox(
+            phoneme_render_backend_row,
+            textvariable=self.phoneme_render_backend_var,
+            values=PHONEME_RENDER_BACKENDS,
+            state="readonly",
+        )
+        self.phoneme_render_backend_combo.pack(side=tk.LEFT, fill=tk.X, expand=True)
+
+        kokoro_voice_row = ttk.Frame(container)
+        kokoro_voice_row.pack(fill=tk.X, pady=(12, 0))
+        ttk.Label(kokoro_voice_row, text="Kokoro voice", width=14).pack(side=tk.LEFT)
+        self.kokoro_voice_combo = ttk.Combobox(
+            kokoro_voice_row,
+            textvariable=self.kokoro_voice_var,
+            values=KOKORO_VOICE_OPTIONS,
+            state="readonly",
+        )
+        self.kokoro_voice_combo.pack(side=tk.LEFT, fill=tk.X, expand=True)
+
+        style_transfer_backend_row = ttk.Frame(container)
+        style_transfer_backend_row.pack(fill=tk.X, pady=(12, 0))
+        ttk.Label(style_transfer_backend_row, text="Style transfer", width=14).pack(side=tk.LEFT)
+        self.style_transfer_backend_combo = ttk.Combobox(
+            style_transfer_backend_row,
+            textvariable=self.style_transfer_backend_var,
+            values=STYLE_TRANSFER_BACKENDS,
+            state="readonly",
+        )
+        self.style_transfer_backend_combo.pack(side=tk.LEFT, fill=tk.X, expand=True)
+
+        style_transfer_target_row = ttk.Frame(container)
+        style_transfer_target_row.pack(fill=tk.X, pady=(12, 0))
+        ttk.Label(style_transfer_target_row, text="Target preset", width=14).pack(side=tk.LEFT)
+        self.style_transfer_target_combo = ttk.Combobox(
+            style_transfer_target_row,
+            textvariable=self.style_transfer_target_voice_var,
+            values=(),
+            state="readonly",
+        )
+        self.style_transfer_target_combo.pack(side=tk.LEFT, fill=tk.X, expand=True)
 
         phoneme_frame = ttk.LabelFrame(container, text="Phoneme Quality", padding=12)
         phoneme_frame.pack(fill=tk.X, pady=(12, 0))
@@ -1449,6 +1601,24 @@ class SpeechDistortionGui:
         self._invalidate_blabber_sequence()
         self._schedule_live_blabber_sequence_update()
 
+    def _on_voice_mode_changed(self, *_args: object) -> None:
+        if self.voice_mode_var.get().strip().lower() != "woman":
+            self.style_transfer_backend_var.set(STYLE_TRANSFER_BACKEND_NONE)
+        self._update_mode_state()
+        self._on_blabber_inputs_changed()
+
+    def _on_style_transfer_backend_changed(self, *_args: object) -> None:
+        self._update_mode_state()
+        self._on_blabber_inputs_changed()
+
+    def _refresh_style_transfer_presets(self) -> None:
+        presets = male_style_transfer_presets(self.style_transfer_presets_path)
+        self.style_transfer_preset_names = [preset.name for preset in presets]
+        self.style_transfer_target_combo.configure(values=self.style_transfer_preset_names)
+        current_value = self.style_transfer_target_voice_var.get().strip()
+        if current_value not in self.style_transfer_preset_names:
+            self.style_transfer_target_voice_var.set(self.style_transfer_preset_names[0] if self.style_transfer_preset_names else "")
+
     def _refresh_phoneme_controls(self) -> None:
         for child in self.phoneme_controls_frame.winfo_children():
             child.destroy()
@@ -1526,9 +1696,34 @@ class SpeechDistortionGui:
         if mode == "blabber":
             self.voice_mode_combo.state(["!disabled", "readonly"])
             self.generate_sequence_button.state(["!disabled"])
+            self.style_transfer_backend_combo.state(["!disabled", "readonly"])
+            self.phoneme_render_backend_combo.state(["!disabled", "readonly"])
         else:
             self.voice_mode_combo.state(["disabled"])
             self.generate_sequence_button.state(["disabled"])
+            self.style_transfer_backend_combo.state(["disabled"])
+            self.phoneme_render_backend_combo.state(["disabled"])
+        if mode == "blabber" and self.voice_mode_var.get() == "man":
+            self.male_speaker_combo.state(["!disabled", "readonly"])
+        else:
+            self.male_speaker_combo.state(["disabled"])
+        if (
+            mode == "blabber"
+            and self.voice_mode_var.get() == "woman"
+            and self.phoneme_render_backend_var.get().strip() == PHONEME_RENDER_BACKEND_KOKORO
+        ):
+            self.kokoro_voice_combo.state(["!disabled", "readonly"])
+        else:
+            self.kokoro_voice_combo.state(["disabled"])
+        if (
+            mode == "blabber"
+            and self.style_transfer_backend_var.get() != STYLE_TRANSFER_BACKEND_NONE
+            and self.voice_mode_var.get() == "woman"
+            and self.style_transfer_preset_names
+        ):
+            self.style_transfer_target_combo.state(["!disabled", "readonly"])
+        else:
+            self.style_transfer_target_combo.state(["disabled"])
         self._update_quality_mode_state()
 
     def _invalidate_blabber_sequence(self) -> None:
@@ -1585,6 +1780,47 @@ class SpeechDistortionGui:
             phoneme_qualities,
             max_phoneme_distance,
         )
+
+    def _current_male_speaker(self) -> str | None:
+        voice_mode = normalize_blabber_voice_mode(self.voice_mode_var.get())
+        if voice_mode != "man":
+            return None
+        speaker_name = self.male_speaker_var.get().strip() or DEFAULT_MALE_COQUI_SPEAKER
+        if speaker_name not in MALE_COQUI_SPEAKER_OPTIONS:
+            self.male_speaker_var.set(DEFAULT_MALE_COQUI_SPEAKER)
+            return DEFAULT_MALE_COQUI_SPEAKER
+        return speaker_name
+
+    def _current_style_transfer_controls(self) -> tuple[str, str]:
+        backend = self.style_transfer_backend_var.get().strip() or STYLE_TRANSFER_BACKEND_NONE
+        if self.voice_mode_var.get().strip().lower() != "woman":
+            return STYLE_TRANSFER_BACKEND_NONE, ""
+        if backend == STYLE_TRANSFER_BACKEND_NONE:
+            return backend, ""
+        target_voice = self.style_transfer_target_voice_var.get().strip()
+        if not target_voice:
+            raise ValueError(
+                "No male style transfer preset is configured. "
+                f"Add presets to '{self.style_transfer_presets_path}'."
+            )
+        if target_voice not in self.style_transfer_preset_names:
+            raise ValueError(
+                f"Unknown style transfer preset '{target_voice}'. "
+                f"Update '{self.style_transfer_presets_path}' or choose another preset."
+            )
+        return backend, target_voice
+
+    def _current_backend_voice(self) -> str | None:
+        if self.voice_mode_var.get().strip().lower() != "woman":
+            return None
+        backend = self.phoneme_render_backend_var.get().strip()
+        if backend != PHONEME_RENDER_BACKEND_KOKORO:
+            return None
+        voice_name = self.kokoro_voice_var.get().strip().lower() or DEFAULT_KOKORO_VOICE
+        if voice_name not in KOKORO_VOICE_OPTIONS:
+            self.kokoro_voice_var.set(DEFAULT_KOKORO_VOICE)
+            return DEFAULT_KOKORO_VOICE
+        return voice_name
 
     def _compute_blabber_sequence(self) -> dict[str, object]:
         transcript, quality, quality_mode, phoneme_qualities, \
@@ -1759,6 +1995,10 @@ class SpeechDistortionGui:
         transcript = self.transcript_var.get()
         phoneme_qualities = [float(var.get()) for var in self.phoneme_quality_vars] if use_per_phoneme else None
         voice_mode = normalize_blabber_voice_mode(self.voice_mode_var.get())
+        male_speaker = self._current_male_speaker()
+        phoneme_render_backend = self.phoneme_render_backend_var.get().strip() or DEFAULT_PHONEME_RENDER_BACKEND
+        backend_voice = self._current_backend_voice()
+        style_transfer_backend, style_transfer_target_voice = self._current_style_transfer_controls()
         try:
             if mode == "static_noise":
                 if use_per_phoneme:
@@ -1852,6 +2092,9 @@ class SpeechDistortionGui:
                         list(cached_sequence["source_phones"]),
                         list(cached_sequence["mutated_phones"]),
                         voice_mode=voice_mode,
+                        speaker_name=male_speaker,
+                        phoneme_render_backend=phoneme_render_backend,
+                        backend_voice=backend_voice,
                         phoneme_qualities=phoneme_qualities or [],
                         segmentation="phonetic",
                         per_phone_preset_indices=(
@@ -1875,6 +2118,14 @@ class SpeechDistortionGui:
                             else None
                         ),
                     )
+                    self.rendered_audio = apply_style_transfer(
+                        self.rendered_audio,
+                        style_transfer_backend,
+                        target_voice=style_transfer_target_voice,
+                        presets_path=self.style_transfer_presets_path,
+                        conda_env_name=COQUI_ENV_NAME,
+                        base_voice_mode=voice_mode,
+                    )
                 else:
                     if cached_sequence is None:
                         cached_sequence = self._compute_blabber_sequence()
@@ -1895,6 +2146,9 @@ class SpeechDistortionGui:
                         list(cached_sequence["source_phones"]),
                         list(cached_sequence["mutated_phones"]),
                         voice_mode=voice_mode,
+                        speaker_name=male_speaker,
+                        phoneme_render_backend=phoneme_render_backend,
+                        backend_voice=backend_voice,
                         quality=quality,
                         breakpoints=breakpoint_label,
                         segmentation="phonetic",
@@ -1914,6 +2168,14 @@ class SpeechDistortionGui:
                             if cached_sequence.get("global_max_phoneme_distance") is not None
                             else None
                         ),
+                    )
+                    self.rendered_audio = apply_style_transfer(
+                        self.rendered_audio,
+                        style_transfer_backend,
+                        target_voice=style_transfer_target_voice,
+                        presets_path=self.style_transfer_presets_path,
+                        conda_env_name=COQUI_ENV_NAME,
+                        base_voice_mode=voice_mode,
                     )
         except Exception as exc:
             self.rendered_audio = None
@@ -1936,6 +2198,19 @@ class SpeechDistortionGui:
             details.append(f"Voice mode: {metadata.get('voice_mode', 'woman')}")
             if metadata.get("coqui_model_name"):
                 details.append(f"Coqui model: {metadata['coqui_model_name']}")
+            if metadata.get("coqui_speaker"):
+                details.append(f"Coqui speaker: {metadata['coqui_speaker']}")
+            if metadata.get("phoneme_render_backend"):
+                details.append(f"Phoneme backend: {metadata['phoneme_render_backend']}")
+            if metadata.get("phoneme_render_model_name"):
+                details.append(f"Phoneme model: {metadata['phoneme_render_model_name']}")
+            if metadata.get("kokoro_voice"):
+                details.append(f"Kokoro voice: {metadata['kokoro_voice']}")
+            details.append(f"Style transfer: {metadata.get('style_transfer_backend', 'none')}")
+            if metadata.get("style_transfer_target_voice"):
+                details.append(f"Style target: {metadata['style_transfer_target_voice']}")
+            if metadata.get("style_transfer_status"):
+                details.append(f"Style status: {metadata['style_transfer_status']}")
         if "breakpoints" in metadata:
             details.append(f"Breakpoints: {metadata['breakpoints']}")
         if "transcript" in metadata:

@@ -1,0 +1,20 @@
+{
+    "presets": [
+        {
+            "name": "male_neutral_01",
+            "display_name": "Male Neutral 01",
+            "target_gender": "male",
+            "target_wavs": [
+                "/data/raqchia/audio-assets/en.text-to-speech.online/aus-en_man/aus-en_man_bath_trim.wav",
+                "/data/raqchia/audio-assets/en.text-to-speech.online/aus-en_man/aus-en_man_food_trim.wav",
+                "/data/raqchia/audio-assets/en.text-to-speech.online/aus-en_man/aus-en_man_go_trim.wav",
+                "/data/raqchia/audio-assets/en.text-to-speech.online/aus-en_man/aus-en_man_help_trim.wav",
+                "/data/raqchia/audio-assets/en.text-to-speech.online/aus-en_man/aus-en_man_no_trim.wav",
+                "/data/raqchia/audio-assets/en.text-to-speech.online/aus-en_man/aus-en_man_pain_trim.wav",
+                "/data/raqchia/audio-assets/en.text-to-speech.online/aus-en_man/aus-en_man_stop_trim.wav",
+                "/data/raqchia/audio-assets/en.text-to-speech.online/aus-en_man/aus-en_man_yes_trim.wav"
+            ],
+            "description": "Clean neutral male reference."
+        }
+    ]
+}
