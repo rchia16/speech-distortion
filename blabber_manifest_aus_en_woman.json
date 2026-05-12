@@ -1,0 +1,38 @@
+[
+  {
+    "audio_path": "/data/raqchia/audio-assets/en.text-to-speech.online/aus-en_woman/aus-en_woman_bath_trim.wav",
+    "transcript": "bath",
+    "phoneme_count": 3,
+    "phonemes": ["B", "AE", "TH"]
+  },
+  {
+    "audio_path": "/data/raqchia/audio-assets/en.text-to-speech.online/aus-en_woman/aus-en_woman_food_trim.wav",
+    "transcript": "food",
+    "phoneme_count": 3,
+    "phonemes": ["F", "UW", "D"]
+  },
+  {
+    "audio_path": "/data/raqchia/audio-assets/en.text-to-speech.online/aus-en_woman/aus-en_woman_help_trim.wav",
+    "transcript": "help",
+    "phoneme_count": 4,
+    "phonemes": ["HH", "EH", "L", "P"]
+  },
+  {
+    "audio_path": "/data/raqchia/audio-assets/en.text-to-speech.online/aus-en_woman/aus-en_woman_no_trim.wav",
+    "transcript": "no",
+    "phoneme_count": 2,
+    "phonemes": ["N", "OW"]
+  },
+  {
+    "audio_path": "/data/raqchia/audio-assets/en.text-to-speech.online/aus-en_woman/aus-en_woman_stop_trim.wav",
+    "transcript": "stop",
+    "phoneme_count": 4,
+    "phonemes": ["S", "T", "OW", "P"]
+  },
+  {
+    "audio_path": "/data/raqchia/audio-assets/en.text-to-speech.online/aus-en_woman/aus-en_woman_yes_trim.wav",
+    "transcript": "yes",
+    "phoneme_count": 3,
+    "phonemes": ["Y", "EH", "S"]
+  }
+]

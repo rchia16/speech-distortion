@@ -40,17 +40,126 @@ DEFAULT_FASTPITCH_RENDERER = os.environ.get("BLABBER_FASTPITCH_RENDERER", "").st
 DEFAULT_FASTPITCH_MODEL = os.environ.get("BLABBER_FASTPITCH_MODEL", "nvidia/tts_en_fastpitch").strip()
 DEFAULT_FASTPITCH_HIFIGAN_MODEL = os.environ.get("BLABBER_FASTPITCH_HIFIGAN_MODEL", "nvidia/tts_hifigan").strip()
 DEFAULT_KOKORO_MODEL = os.environ.get("BLABBER_KOKORO_MODEL", "hexgrad/Kokoro-82M").strip()
+KOKORO_VOICE_AF_HEART = "af_heart"
+KOKORO_VOICE_AF_ALLOY = "af_alloy"
+KOKORO_VOICE_AF_AOEDE = "af_aoede"
+KOKORO_VOICE_AF_BELLA = "af_bella"
+KOKORO_VOICE_AF_JESSICA = "af_jessica"
+KOKORO_VOICE_AF_KORE = "af_kore"
+KOKORO_VOICE_AF_NICOLE = "af_nicole"
+KOKORO_VOICE_AF_NOVA = "af_nova"
+KOKORO_VOICE_AF_RIVER = "af_river"
+KOKORO_VOICE_AF_SARAH = "af_sarah"
+KOKORO_VOICE_AF_SKY = "af_sky"
+KOKORO_VOICE_AM_ADAM = "am_adam"
+KOKORO_VOICE_AM_ECHO = "am_echo"
+KOKORO_VOICE_AM_ERIC = "am_eric"
+KOKORO_VOICE_AM_FENRIR = "am_fenrir"
+KOKORO_VOICE_AM_LIAM = "am_liam"
+KOKORO_VOICE_AM_MICHAEL = "am_michael"
+KOKORO_VOICE_AM_ONYX = "am_onyx"
+KOKORO_VOICE_AM_PUCK = "am_puck"
+KOKORO_VOICE_AM_SANTA = "am_santa"
+KOKORO_VOICE_BF_ALICE = "bf_alice"
 KOKORO_VOICE_BF_EMMA = "bf_emma"
+KOKORO_VOICE_BF_ISABELLA = "bf_isabella"
+KOKORO_VOICE_BF_LILY = "bf_lily"
+KOKORO_VOICE_BM_DANIEL = "bm_daniel"
+KOKORO_VOICE_BM_FABLE = "bm_fable"
+KOKORO_VOICE_BM_GEORGE = "bm_george"
+KOKORO_VOICE_BM_LEWIS = "bm_lewis"
 KOKORO_VOICE_GM_FABLE = "gm_fable"
+KOKORO_VOICE_JF_ALPHA = "jf_alpha"
+KOKORO_VOICE_JF_GONGITSUNE = "jf_gongitsune"
+KOKORO_VOICE_JF_NEZUMI = "jf_nezumi"
+KOKORO_VOICE_JF_TEBUKURO = "jf_tebukuro"
+KOKORO_VOICE_JM_KUMO = "jm_kumo"
+KOKORO_VOICE_ZF_XIAOBEI = "zf_xiaobei"
+KOKORO_VOICE_ZF_XIAONI = "zf_xiaoni"
+KOKORO_VOICE_ZF_XIAOXIAO = "zf_xiaoxiao"
+KOKORO_VOICE_ZF_XIAOYI = "zf_xiaoyi"
+KOKORO_VOICE_ZM_YUNJIAN = "zm_yunjian"
+KOKORO_VOICE_ZM_YUNXI = "zm_yunxi"
+KOKORO_VOICE_ZM_YUNXIA = "zm_yunxia"
+KOKORO_VOICE_ZM_YUNYANG = "zm_yunyang"
+KOKORO_VOICE_EF_DORA = "ef_dora"
+KOKORO_VOICE_EM_ALEX = "em_alex"
+KOKORO_VOICE_EM_SANTA = "em_santa"
+KOKORO_VOICE_FF_SIWIS = "ff_siwis"
+KOKORO_VOICE_HF_ALPHA = "hf_alpha"
+KOKORO_VOICE_HF_BETA = "hf_beta"
+KOKORO_VOICE_HM_OMEGA = "hm_omega"
+KOKORO_VOICE_HM_PSI = "hm_psi"
+KOKORO_VOICE_IF_SARA = "if_sara"
+KOKORO_VOICE_IM_NICOLA = "im_nicola"
+KOKORO_VOICE_PF_DORA = "pf_dora"
+KOKORO_VOICE_PM_ALEX = "pm_alex"
+KOKORO_VOICE_PM_SANTA = "pm_santa"
 DEFAULT_KOKORO_VOICE = os.environ.get("BLABBER_KOKORO_VOICE", KOKORO_VOICE_BF_EMMA).strip().lower()
-KOKORO_VOICE_OPTIONS: tuple[str, str] = (
+DEFAULT_KOKORO_MALE_VOICE = os.environ.get("BLABBER_KOKORO_MALE_VOICE", KOKORO_VOICE_BM_LEWIS).strip().lower()
+KOKORO_VOICE_OPTIONS: tuple[str, ...] = (
+    KOKORO_VOICE_AF_HEART,
+    KOKORO_VOICE_AF_ALLOY,
+    KOKORO_VOICE_AF_AOEDE,
+    KOKORO_VOICE_AF_BELLA,
+    KOKORO_VOICE_AF_JESSICA,
+    KOKORO_VOICE_AF_KORE,
+    KOKORO_VOICE_AF_NICOLE,
+    KOKORO_VOICE_AF_NOVA,
+    KOKORO_VOICE_AF_RIVER,
+    KOKORO_VOICE_AF_SARAH,
+    KOKORO_VOICE_AF_SKY,
+    KOKORO_VOICE_AM_ADAM,
+    KOKORO_VOICE_AM_ECHO,
+    KOKORO_VOICE_AM_ERIC,
+    KOKORO_VOICE_AM_FENRIR,
+    KOKORO_VOICE_AM_LIAM,
+    KOKORO_VOICE_AM_MICHAEL,
+    KOKORO_VOICE_AM_ONYX,
+    KOKORO_VOICE_AM_PUCK,
+    KOKORO_VOICE_AM_SANTA,
+    KOKORO_VOICE_BF_ALICE,
     KOKORO_VOICE_BF_EMMA,
+    KOKORO_VOICE_BF_ISABELLA,
+    KOKORO_VOICE_BF_LILY,
+    KOKORO_VOICE_BM_DANIEL,
+    KOKORO_VOICE_BM_FABLE,
+    KOKORO_VOICE_BM_GEORGE,
+    KOKORO_VOICE_BM_LEWIS,
     KOKORO_VOICE_GM_FABLE,
+    KOKORO_VOICE_JF_ALPHA,
+    KOKORO_VOICE_JF_GONGITSUNE,
+    KOKORO_VOICE_JF_NEZUMI,
+    KOKORO_VOICE_JF_TEBUKURO,
+    KOKORO_VOICE_JM_KUMO,
+    KOKORO_VOICE_ZF_XIAOBEI,
+    KOKORO_VOICE_ZF_XIAONI,
+    KOKORO_VOICE_ZF_XIAOXIAO,
+    KOKORO_VOICE_ZF_XIAOYI,
+    KOKORO_VOICE_ZM_YUNJIAN,
+    KOKORO_VOICE_ZM_YUNXI,
+    KOKORO_VOICE_ZM_YUNXIA,
+    KOKORO_VOICE_ZM_YUNYANG,
+    KOKORO_VOICE_EF_DORA,
+    KOKORO_VOICE_EM_ALEX,
+    KOKORO_VOICE_EM_SANTA,
+    KOKORO_VOICE_FF_SIWIS,
+    KOKORO_VOICE_HF_ALPHA,
+    KOKORO_VOICE_HF_BETA,
+    KOKORO_VOICE_HM_OMEGA,
+    KOKORO_VOICE_HM_PSI,
+    KOKORO_VOICE_IF_SARA,
+    KOKORO_VOICE_IM_NICOLA,
+    KOKORO_VOICE_PF_DORA,
+    KOKORO_VOICE_PM_ALEX,
+    KOKORO_VOICE_PM_SANTA,
 )
 KOKORO_VOICE_ALIASES: Mapping[str, str] = {
-    KOKORO_VOICE_BF_EMMA: "bf_emma",
-    KOKORO_VOICE_GM_FABLE: "bm_fable",
-    "bm_fable": "bm_fable",
+    **{voice_name: voice_name for voice_name in KOKORO_VOICE_OPTIONS if not voice_name.startswith("gm_")},
+    KOKORO_VOICE_GM_FABLE: KOKORO_VOICE_BM_FABLE,
+    "gm_lewis": KOKORO_VOICE_BM_LEWIS,
+    "gm_daniel": KOKORO_VOICE_BM_DANIEL,
+    "gm_george": KOKORO_VOICE_BM_GEORGE,
 }
 DEFAULT_PHONEME_VITS_MODEL = os.environ.get("BLABBER_PHONEME_VITS_MODEL", "").strip()
 
@@ -193,10 +302,27 @@ def phones_to_kokoro_markup(phones: Sequence[str]) -> str:
 
 def _kokoro_lang_code_for_voice(voice_name: str) -> str:
     prefix = voice_name[:2].lower()
-    if prefix in {"af", "am"}:
-        return "a"
-    if prefix in {"bf", "bm"}:
-        return "b"
+    lang_codes = {
+        "af": "a",
+        "am": "a",
+        "bf": "b",
+        "bm": "b",
+        "jf": "j",
+        "jm": "j",
+        "zf": "z",
+        "zm": "z",
+        "ef": "e",
+        "em": "e",
+        "ff": "f",
+        "hf": "h",
+        "hm": "h",
+        "if": "i",
+        "im": "i",
+        "pf": "p",
+        "pm": "p",
+    }
+    if prefix in lang_codes:
+        return lang_codes[prefix]
     raise ValueError(f"Unsupported Kokoro voice prefix for '{voice_name}'.")
 
 

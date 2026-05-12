@@ -21,6 +21,7 @@ ASSET_MODES = (ASSET_MODE_AUTO, ASSET_MODE_GLOBAL, ASSET_MODE_PER_PHONEME)
 @dataclass(frozen=True)
 class AssetCandidate:
     word: str
+    gender: str
     voice_mode: str
     generation_mode: str
     phoneme_values: tuple[float, ...]
@@ -54,6 +55,68 @@ def normalize_voice_mode(value: str) -> str:
     if normalized not in aliases:
         raise ValueError("Voice must be one of: female, woman, male, man.")
     return aliases[normalized]
+
+
+def normalize_gender(value: str) -> str:
+    normalized = str(value).strip().lower()
+    aliases = {
+        "female": "female",
+        "woman": "female",
+        "male": "male",
+        "man": "male",
+    }
+    if normalized not in aliases:
+        raise ValueError("Gender must be one of: female, male.")
+    return aliases[normalized]
+
+
+def gender_to_voice_mode(gender: str) -> str:
+    return "woman" if normalize_gender(gender) == "female" else "man"
+
+
+def _infer_voice_mode_from_paths(*paths: Path) -> str | None:
+    aliases = {
+        "female": "woman",
+        "woman": "woman",
+        "male": "man",
+        "man": "man",
+    }
+    for path in paths:
+        for part in path.parts:
+            normalized = str(part).strip().lower()
+            if normalized in aliases:
+                return aliases[normalized]
+    return None
+
+
+def _resolve_effective_voice_mode(
+    explicit_voice_value: Any,
+    *paths: Path,
+) -> str:
+    inferred = _infer_voice_mode_from_paths(*paths)
+    if explicit_voice_value is not None and str(explicit_voice_value).strip():
+        explicit = normalize_voice_mode(str(explicit_voice_value))
+        if inferred is not None and inferred != explicit:
+            return inferred
+        return explicit
+    if inferred is not None:
+        return inferred
+    raise ValueError("Voice must be one of: female, woman, male, man.")
+
+
+def _resolve_effective_gender(
+    explicit_gender_value: Any,
+    explicit_voice_value: Any,
+    *paths: Path,
+) -> str:
+    if explicit_gender_value is not None and str(explicit_gender_value).strip():
+        return normalize_gender(str(explicit_gender_value))
+    if explicit_voice_value is not None and str(explicit_voice_value).strip():
+        return normalize_gender(str(explicit_voice_value))
+    inferred_voice_mode = _infer_voice_mode_from_paths(*paths)
+    if inferred_voice_mode is not None:
+        return normalize_gender(inferred_voice_mode)
+    raise ValueError("Gender must be one of: female, male.")
 
 
 def normalize_asset_mode(value: str) -> str:
@@ -113,17 +176,20 @@ def load_asset_index(index_path: Path) -> list[AssetCandidate]:
 
     for row in rows:
         word_value = row.get("word") or row.get("transcript") or row.get("label_name")
+        gender_value = row.get("gender")
         voice_value = row.get("voice_mode") or row.get("voice") or row.get("gender")
         generation_mode = row.get("generation_mode") or row.get("mode") or row.get("bank") or ASSET_MODE_PER_PHONEME
         audio_value = row.get("audio_path") or row.get("output_audio_path") or row.get("file")
         sidecar_value = row.get("sidecar_path") or row.get("json_path") or row.get("metadata_path")
         phoneme_values = row.get("phoneme_values")
+        if phoneme_values is None and normalize_asset_mode(str(generation_mode)) == ASSET_MODE_GLOBAL:
+            quality_value = row.get("quality")
+            if quality_value is not None:
+                phoneme_values = [quality_value]
         source_phonemes = row.get("source_phonemes")
 
         if not word_value:
             raise ValueError("Each asset index row must define 'word', 'transcript', or 'label_name'.")
-        if not voice_value:
-            raise ValueError(f"Asset index row for '{word_value}' is missing 'voice_mode'.")
         if not audio_value:
             raise ValueError(f"Asset index row for '{word_value}' is missing 'audio_path'.")
         if not sidecar_value:
@@ -134,14 +200,25 @@ def load_asset_index(index_path: Path) -> list[AssetCandidate]:
             raise ValueError(f"Asset index row for '{word_value}' is missing 'source_phonemes'.")
 
         label_id = row.get("label_id")
+        resolved_audio_path = _resolve_path(audio_value, base_dir)
+        resolved_sidecar_path = _resolve_path(sidecar_value, base_dir)
+        resolved_gender = _resolve_effective_gender(
+            gender_value,
+            voice_value,
+            index_path,
+            resolved_audio_path,
+            resolved_sidecar_path,
+        )
+        resolved_voice_mode = gender_to_voice_mode(resolved_gender)
         candidates.append(
             AssetCandidate(
                 word=normalize_word(str(word_value)),
-                voice_mode=normalize_voice_mode(str(voice_value)),
+                gender=resolved_gender,
+                voice_mode=resolved_voice_mode,
                 generation_mode=normalize_asset_mode(str(generation_mode)),
                 phoneme_values=_coerce_float_list(phoneme_values, "phoneme_values"),
-                audio_path=_resolve_path(audio_value, base_dir),
-                sidecar_path=_resolve_path(sidecar_value, base_dir),
+                audio_path=resolved_audio_path,
+                sidecar_path=resolved_sidecar_path,
                 source_phonemes=_coerce_string_list(source_phonemes, "source_phonemes"),
                 label_id=int(label_id) if label_id is not None else None,
                 raw=dict(row),
@@ -169,10 +246,19 @@ def scan_asset_root(asset_root: Path) -> list[AssetCandidate]:
             audio_value = payload.get("output_audio_path") or sidecar_path.with_suffix(".wav").name
             label_id = payload.get("label_id", metadata.get("label_id"))
             resolved_audio_path = _resolve_path(audio_value, sidecar_path.parent)
+            resolved_gender = _resolve_effective_gender(
+                payload.get("gender", metadata.get("gender")),
+                metadata.get("voice_mode"),
+                asset_root,
+                resolved_audio_path,
+                sidecar_path.resolve(),
+            )
+            resolved_voice_mode = gender_to_voice_mode(resolved_gender)
             candidates.append(
                 AssetCandidate(
                     word=normalize_word(str(word_value)),
-                    voice_mode=normalize_voice_mode(str(metadata.get("voice_mode", "woman"))),
+                    gender=resolved_gender,
+                    voice_mode=resolved_voice_mode,
                     generation_mode=generation_mode,
                     phoneme_values=_coerce_float_list(phoneme_values, "phoneme_values"),
                     audio_path=resolved_audio_path,
@@ -182,7 +268,8 @@ def scan_asset_root(asset_root: Path) -> list[AssetCandidate]:
                     raw={
                         "word": str(word_value),
                         "transcript": str(word_value),
-                        "voice_mode": metadata.get("voice_mode", "woman"),
+                        "gender": resolved_gender,
+                        "voice_mode": resolved_voice_mode,
                         "generation_mode": generation_mode,
                         "audio_path": str(resolved_audio_path),
                         "sidecar_path": str(sidecar_path.resolve()),
@@ -334,6 +421,7 @@ def _build_selection_result(
     distance_sum, distance_max = _selection_distance(requested_signature, candidate.phoneme_values)
     return {
         "word": requested_word,
+        "gender": candidate.gender,
         "voice_mode": requested_voice,
         "generation_mode": candidate.generation_mode,
         "comparison_source": comparison["source"],
@@ -372,11 +460,12 @@ def select_asset(
         raise ValueError("A target word, target label id, or comparison label must be available for selection.")
 
     normalized_generation_mode = normalize_asset_mode(generation_mode)
+    requested_gender = normalize_gender(requested_voice)
     resolved_label_id = target_label_id if target_label_id is not None else comparison.get("label_id")
     filtered = [
         candidate
         for candidate in candidates
-        if candidate.voice_mode == requested_voice
+        if candidate.gender == requested_gender
         and (normalized_generation_mode == ASSET_MODE_AUTO or candidate.generation_mode == normalized_generation_mode)
         and (
             candidate.word == resolved_word

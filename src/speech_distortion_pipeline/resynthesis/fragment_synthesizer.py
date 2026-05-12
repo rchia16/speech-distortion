@@ -43,6 +43,9 @@ def resolve_python_command(target_conda_env_name: str | None = None) -> list[str
     current_env = os.environ.get("CONDA_DEFAULT_ENV", "").strip().lower()
     if target_name and current_env == target_name:
         return [sys.executable]
+    current_prefix_path = os.environ.get("CONDA_PREFIX", "").strip()
+    if not current_env and not current_prefix_path:
+        return [sys.executable]
     conda_command = resolve_conda_command()
     if conda_command == ["conda"]:
         return [sys.executable]

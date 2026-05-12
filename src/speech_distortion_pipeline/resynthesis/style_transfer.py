@@ -122,6 +122,7 @@ def apply_style_transfer(
     presets_path: str | Path | None = None,
     conda_env_name: str = "coqui-blabber",
     base_voice_mode: str = "woman",
+    use_gpu: bool = False,
 ) -> AudioBuffer:
     normalized_backend = normalize_style_transfer_backend(backend)
     resolved_target_voice = str(target_voice).strip()
@@ -139,7 +140,13 @@ def apply_style_transfer(
         presets_path=presets_path,
         required_gender="male",
     )
-    output_audio = _convert_with_coqui_vc(audio, normalized_backend, preset, conda_env_name=conda_env_name)
+    output_audio = _convert_with_coqui_vc(
+        audio,
+        normalized_backend,
+        preset,
+        conda_env_name=conda_env_name,
+        use_gpu=use_gpu,
+    )
     return _clone_audio_with_metadata(
         output_audio,
         **dict(audio.metadata),
@@ -216,6 +223,7 @@ def _convert_with_coqui_vc(
     backend: str,
     preset: StyleTransferPreset,
     conda_env_name: str,
+    use_gpu: bool,
 ) -> AudioBuffer:
     writer = WavAudioWriter()
     reader = WavAudioReader()
@@ -231,6 +239,7 @@ def _convert_with_coqui_vc(
             backend=backend,
             target_wav_paths=preset.target_wav_paths,
             conda_env_name=conda_env_name,
+            use_gpu=use_gpu,
         )
 
         if not output_path.is_file():
@@ -245,6 +254,7 @@ def _run_coqui_vc(
     backend: str,
     target_wav_paths: Sequence[str],
     conda_env_name: str,
+    use_gpu: bool,
 ) -> None:
     fd_script, script_path = tempfile.mkstemp(prefix="speech_distortion_vc_", suffix=".py")
     os.close(fd_script)
@@ -256,7 +266,7 @@ def _run_coqui_vc(
         env["COQUI_VC_SOURCE_WAV"] = str(source_wav_path)
         env["COQUI_VC_TARGET_WAVS"] = json.dumps(list(target_wav_paths))
         env["COQUI_VC_OUT"] = str(output_wav_path)
-        env["COQUI_VC_USE_GPU"] = "0"
+        env["COQUI_VC_USE_GPU"] = "1" if use_gpu else "0"
         completed = subprocess.run(
             resolve_python_command(conda_env_name) + [script_path],
             check=False,
