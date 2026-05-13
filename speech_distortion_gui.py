@@ -26,8 +26,12 @@ if str(SRC) not in sys.path:
 from speech_distortion_pipeline.io import WavAudioReader, WavAudioWriter
 from speech_distortion_pipeline.models import AudioBuffer
 from speech_distortion_pipeline.models.edits import EditType
-from speech_distortion_pipeline.bootstrap import build_pronunciation_stitching_slice, build_slider_controls
-from speech_distortion_pipeline.config import load_pronunciation_slider_config
+from speech_distortion_pipeline.bootstrap import (
+    build_hybrid_planning_slice,
+    build_hybrid_stitching_slice,
+    build_slider_controls,
+)
+from speech_distortion_pipeline.config import load_hybrid_config
 from speech_distortion_pipeline.phonology.blabber_config import (
     BLABBER_VOICE_MODES,
     COQUI_ENV_NAME,
@@ -73,7 +77,7 @@ from speech_distortion_pipeline.resynthesis.style_transfer import (
     male_style_transfer_presets,
 )
 DEFAULT_INPUT = ROOT / DEFAULT_GUI_INPUT_FILENAME
-DEFAULT_PRONUNCIATION_SLIDER_CONFIG = ROOT / "pronunciation_sliders.yaml"
+DEFAULT_PRONUNCIATION_SLIDER_CONFIG = ROOT / "hybrid.yaml"
 MAX_DROPOUT_FRACTION = 0.8
 MAX_DROPOUT_SILENCE_MS = 200.0
 GLOBAL_BLABBER_MAX_PHONEME_DISTANCE_VALUES = tuple(f"{value / 10.0:.1f}" for value in range(8, 101))
@@ -1272,8 +1276,8 @@ def render_pronunciation_safe(
     timing_instability: float,
     allow_full_gibberish: bool = False,
 ) -> AudioBuffer:
-    config = load_pronunciation_slider_config(slider_config_path)
-    runtime = build_pronunciation_stitching_slice(config)
+    config = load_hybrid_config(slider_config_path)
+    runtime = build_hybrid_stitching_slice(config)
     alignment = runtime.aligner.align(audio, transcript)
     graph = runtime.feature_extractor.build_phone_graph(alignment)
     controls = build_slider_controls(
@@ -1283,12 +1287,17 @@ def render_pronunciation_safe(
         timing_instability=timing_instability,
         allow_full_gibberish=allow_full_gibberish,
     )
-    plan = runtime.planner.plan(graph, controls)
+    plan = runtime.planner.plan(graph, controls, audio=audio)
     timing = runtime.timing_planner.build(graph, plan)
     edited = runtime.source_editor.apply(audio, graph, plan, timing)
     fragments = runtime.fragment_synthesizer.synthesize(audio, graph, plan, timing)
     projected = runtime.timbre_projector.project(audio, fragments)
     stitched = runtime.assembler.assemble(audio, edited, projected)
+    selected_variant = (
+        plan.trace.selected_grapheme_variant
+        if plan.trace is not None and plan.trace.selected_grapheme_variant
+        else transcript.strip()
+    )
     metadata = dict(stitched.metadata)
     metadata.update(
         {
@@ -1302,6 +1311,11 @@ def render_pronunciation_safe(
             "pronunciation_similarity_threshold": f"{plan.similarity.threshold:.4f}",
             "pronunciation_fragment_count": str(len(projected)),
             "pronunciation_repair_count": str(len(plan.repairs)),
+            "pronunciation_selected_word": selected_variant,
+            "pronunciation_selected_word_changed": (
+                "1" if selected_variant.strip().lower() != transcript.strip().lower() else "0"
+            ),
+            "hybrid_config": str(slider_config_path),
             "pronunciation_slider_config": str(slider_config_path),
         }
     )
@@ -1355,6 +1369,8 @@ class SpeechDistortionGui:
         self.detected_phones: list[str] = []
         self.cached_blabber_sequence: dict[str, object] | None = None
         self.live_blabber_sequence_after_id: str | None = None
+        self.live_pronunciation_preview_after_id: str | None = None
+        self.hybrid_planning_runtime = None
 
         self.audio_path_var = tk.StringVar(value=str(DEFAULT_INPUT if DEFAULT_INPUT.exists() else ""))
         self.mode_var = tk.StringVar(value="static_noise")
@@ -1701,14 +1717,17 @@ class SpeechDistortionGui:
         self._invalidate_blabber_sequence()
         self._refresh_phoneme_controls()
         self._schedule_live_blabber_sequence_update()
+        self._schedule_live_pronunciation_preview()
 
     def _on_mode_changed(self, *_args: object) -> None:
         self._invalidate_blabber_sequence()
         self._schedule_live_blabber_sequence_update()
+        self._schedule_live_pronunciation_preview()
 
     def _on_blabber_inputs_changed(self, *_args: object) -> None:
         self._invalidate_blabber_sequence()
         self._schedule_live_blabber_sequence_update()
+        self._schedule_live_pronunciation_preview()
 
     def _on_voice_mode_changed(self, *_args: object) -> None:
         if self.voice_mode_var.get().strip().lower() != "woman":
@@ -1864,6 +1883,32 @@ class SpeechDistortionGui:
             return
         self.live_blabber_sequence_after_id = self.root.after(120, self._refresh_live_blabber_sequence)
 
+    def _cancel_live_pronunciation_preview(self) -> None:
+        if self.live_pronunciation_preview_after_id is None:
+            return
+        try:
+            self.root.after_cancel(self.live_pronunciation_preview_after_id)
+        except tk.TclError:
+            pass
+        self.live_pronunciation_preview_after_id = None
+
+    def _schedule_live_pronunciation_preview(self) -> None:
+        self._cancel_live_pronunciation_preview()
+        if self.mode_var.get() != "pronunciation_safe":
+            return
+        self.live_pronunciation_preview_after_id = self.root.after(120, self._refresh_live_pronunciation_preview)
+
+    def _refresh_live_pronunciation_preview(self) -> None:
+        self.live_pronunciation_preview_after_id = None
+        if self.mode_var.get() != "pronunciation_safe":
+            return
+        try:
+            preview = self._compute_pronunciation_preview()
+        except Exception as exc:
+            self._set_output(f"Live pronunciation preview unavailable\n\n{exc}")
+            return
+        self._set_output(self._format_pronunciation_preview_status(preview))
+
     def _refresh_live_blabber_sequence(self) -> None:
         self.live_blabber_sequence_after_id = None
         if self.mode_var.get() != "blabber":
@@ -1941,6 +1986,92 @@ class SpeechDistortionGui:
             self.kokoro_voice_var.set(DEFAULT_KOKORO_VOICE)
             return DEFAULT_KOKORO_VOICE
         return voice_name
+
+    def _get_hybrid_planning_runtime(self):
+        if self.hybrid_planning_runtime is None:
+            config = load_hybrid_config(DEFAULT_PRONUNCIATION_SLIDER_CONFIG)
+            self.hybrid_planning_runtime = build_hybrid_planning_slice(config)
+        return self.hybrid_planning_runtime
+
+    def _compute_pronunciation_preview(self) -> dict[str, object]:
+        transcript = self.transcript_var.get().strip()
+        if not transcript:
+            raise ValueError("Enter a transcript to preview pronunciation-safe candidates.")
+        path_text = self.audio_path_var.get().strip()
+        if not path_text:
+            raise ValueError("Choose a WAV file to preview pronunciation-safe candidates.")
+        path = Path(path_text)
+        if self.current_audio is None or self.current_audio.metadata.get("source_path") != str(path):
+            self._load_audio(path)
+        if self.current_audio is None:
+            raise ValueError("Input audio is not available.")
+
+        runtime = self._get_hybrid_planning_runtime()
+        controls = build_slider_controls(
+            runtime.config,
+            jibberish=max(0.0, min(1.0, float(self.jibberish_var.get()))),
+            clarity=max(0.0, min(1.0, float(self.clarity_var.get()))),
+            timing_instability=max(0.0, min(1.0, float(self.timing_instability_var.get()))),
+            allow_full_gibberish=bool(self.allow_full_gibberish_var.get()),
+        )
+        alignment = runtime.aligner.align(self.current_audio, transcript)
+        graph = runtime.feature_extractor.build_phone_graph(alignment)
+        plan = runtime.planner.plan(graph, controls, audio=self.current_audio)
+        accepted_candidates = [candidate for candidate in plan.candidates if candidate.accepted]
+        accepted_candidates.sort(
+            key=lambda item: (
+                item.word_index,
+                item.grapheme == item.word,
+                -item.pronunciation_similarity,
+                item.phoneme_distance,
+                item.grapheme,
+            )
+        )
+        return {
+            "transcript": transcript,
+            "selected_word": plan.trace.selected_grapheme_variant if plan.trace is not None else transcript,
+            "selected_phones": list(plan.trace.selected_phones) if plan.trace is not None else [],
+            "similarity_score": plan.similarity.score,
+            "similarity_threshold": plan.similarity.threshold,
+            "accepted_candidates": accepted_candidates[:10],
+            "rejected_count": len([candidate for candidate in plan.candidates if not candidate.accepted]),
+            "jibberish": controls.jibberish,
+            "clarity": controls.clarity,
+            "timing_instability": controls.timing_instability,
+        }
+
+    def _format_pronunciation_preview_status(self, preview: dict[str, object]) -> str:
+        selected_word = str(preview["selected_word"])
+        transcript = str(preview["transcript"])
+        lines = [
+            "Live pronunciation-safe preview",
+            f"Transcript: {transcript}",
+            f"Selected word: {selected_word}",
+            f"Jibberish: {float(preview['jibberish']):.2f}",
+            f"Clarity: {float(preview['clarity']):.2f}",
+            f"Timing instability: {float(preview['timing_instability']):.2f}",
+            (
+                "Similarity: "
+                f"{float(preview['similarity_score']):.4f} / {float(preview['similarity_threshold']):.4f}"
+            ),
+        ]
+        selected_phones = list(preview.get("selected_phones", []))
+        if selected_phones:
+            lines.append(f"Selected phones: {'-'.join(str(phone) for phone in selected_phones)}")
+        accepted_candidates = list(preview.get("accepted_candidates", []))
+        if accepted_candidates:
+            lines.append("Accepted candidates:")
+            for candidate in accepted_candidates[:6]:
+                lines.append(
+                    "  {0}  sim={1:.3f} phone_dist={2:.3f} graph_dist={3:.3f}".format(
+                        candidate.grapheme,
+                        candidate.pronunciation_similarity,
+                        candidate.phoneme_distance,
+                        candidate.grapheme_distance,
+                    )
+                )
+        lines.append(f"Rejected candidates: {int(preview.get('rejected_count', 0))}")
+        return "\n".join(lines)
 
     def _compute_blabber_sequence(self) -> dict[str, object]:
         transcript, quality, quality_mode, phoneme_qualities, \
@@ -2085,6 +2216,7 @@ class SpeechDistortionGui:
         try:
             self.current_audio = self.reader.read(str(path))
             duration = len(self.current_audio.samples) / float(self.current_audio.sample_rate_hz)
+            self.hybrid_planning_runtime = None
             self._set_output(
                 f"Loaded {path.name}\n"
                 f"Sample rate: {self.current_audio.sample_rate_hz} Hz\n"
@@ -2096,6 +2228,7 @@ class SpeechDistortionGui:
 
     def _render(self) -> None:
         self._cancel_live_blabber_sequence_update()
+        self._cancel_live_pronunciation_preview()
         path_text = self.audio_path_var.get().strip()
         if not path_text:
             messagebox.showerror("Missing file", "Choose a WAV file first.")
@@ -2362,6 +2495,8 @@ class SpeechDistortionGui:
                 details.append(f"Editor: {metadata['editor_name']}")
             if metadata.get("assembler_name"):
                 details.append(f"Assembler: {metadata['assembler_name']}")
+            if metadata.get("pronunciation_selected_word_changed") == "1" and metadata.get("pronunciation_selected_word"):
+                details.append(f"Selected word: {metadata['pronunciation_selected_word']}")
         if "breakpoints" in metadata:
             details.append(f"Breakpoints: {metadata['breakpoints']}")
         if "transcript" in metadata:

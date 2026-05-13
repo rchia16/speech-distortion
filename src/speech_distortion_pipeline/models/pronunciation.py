@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import Any, Optional
 
 from .edits import EditOperation
 from .timing import DurationBudget
@@ -13,6 +13,74 @@ class SliderControls:
     clarity: float
     timing_instability: float
     allow_full_gibberish: bool = False
+    distance_overrides: dict[str, float] = field(default_factory=dict)
+
+
+@dataclass
+class DistanceSignal:
+    name: str
+    value: float
+    sources: list[str] = field(default_factory=list)
+    raw_features: dict[str, Any] = field(default_factory=dict)
+    aligned_region: Optional[str] = None
+
+
+@dataclass
+class SliderEstimate:
+    value: float
+    confidence: float
+    evidence_sources: list[str] = field(default_factory=list)
+    routing_rule: Optional[str] = None
+
+
+@dataclass
+class RoutingDecision:
+    slider_name: str
+    value: float
+    confidence: float
+    evidence_sources: list[str] = field(default_factory=list)
+    routing_rule: Optional[str] = None
+
+
+@dataclass
+class DistanceEvidenceBundle:
+    signals: dict[str, DistanceSignal] = field(default_factory=dict)
+    routing: dict[str, RoutingDecision] = field(default_factory=dict)
+
+
+@dataclass
+class CandidateScore:
+    word: str
+    word_index: int
+    grapheme: str
+    phones: list[str] = field(default_factory=list)
+    grapheme_distance: float = 0.0
+    phoneme_distance: float = 0.0
+    pronunciation_similarity: float = 0.0
+    accepted: bool = False
+    rejection_reason: str = ""
+
+
+@dataclass
+class DecisionTrace:
+    target_word: str
+    target_graphemes: str
+    target_phones: list[str] = field(default_factory=list)
+    selected_grapheme_variant: str = ""
+    selected_phones: list[str] = field(default_factory=list)
+    pronunciation_similarity: float = 0.0
+    slider_values: dict[str, float] = field(default_factory=dict)
+    confidence: dict[str, float] = field(default_factory=dict)
+    distance_evidence: dict[str, float] = field(default_factory=dict)
+    distance_features: dict[str, dict[str, Any]] = field(default_factory=dict)
+    routing_rules: dict[str, str] = field(default_factory=dict)
+    acoustic_backend: str = "proxy"
+    acoustic_model_path: str = ""
+    acoustic_model_loaded: bool = False
+    acoustic_model_compatibility: str = "unavailable"
+    edits: list[str] = field(default_factory=list)
+    rejected_candidates: list[str] = field(default_factory=list)
+    repair_actions: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -94,6 +162,12 @@ class PronunciationSafePlan:
     similarity: PronunciationSimilarityScore
     repairs: list[RepairAction] = field(default_factory=list)
     generated_parameters: dict[str, dict[str, float]] = field(default_factory=dict)
+    slider_estimates: dict[str, SliderEstimate] = field(default_factory=dict)
+    distance_evidence: dict[str, DistanceSignal] = field(default_factory=dict)
+    evidence_bundle: Optional[DistanceEvidenceBundle] = None
+    candidates: list[CandidateScore] = field(default_factory=list)
+    selected_candidates: list[CandidateScore] = field(default_factory=list)
+    trace: Optional[DecisionTrace] = None
 
 
 @dataclass

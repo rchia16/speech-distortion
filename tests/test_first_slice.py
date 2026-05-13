@@ -2,6 +2,7 @@ from pathlib import Path
 
 from speech_distortion_pipeline.alignment import build_aligner
 from speech_distortion_pipeline.bootstrap import (
+    build_hybrid_planning_slice,
     build_speech_distortion_pipeline,
     build_editing_slice,
     build_phonology_slice,
@@ -11,7 +12,7 @@ from speech_distortion_pipeline.bootstrap import (
     build_timbre_slice,
     build_timing_slice,
 )
-from speech_distortion_pipeline.config import load_config, load_pronunciation_slider_config
+from speech_distortion_pipeline.config import load_config, load_hybrid_config
 from speech_distortion_pipeline.io import WavAudioReader
 from speech_distortion_pipeline.models import EditType
 
@@ -215,10 +216,10 @@ def test_timbre_slice_projects_fragment_samples() -> None:
 def test_migrated_pipeline_plan_only_bridges_to_pronunciation_safe_operations() -> None:
     root = Path(__file__).resolve().parents[1]
     config = load_config(root / "configs" / "pipeline.example.yaml")
-    pronunciation_config = load_pronunciation_slider_config(root / "pronunciation_sliders.yaml")
+    hybrid_config = load_hybrid_config(root / "hybrid.yaml")
     pipeline = build_speech_distortion_pipeline(
         config,
-        pronunciation_config=pronunciation_config,
+        hybrid_config=hybrid_config,
         prefer_pronunciation_safe=True,
     )
     severity = build_planning_slice(config).severity_profile
@@ -233,10 +234,10 @@ def test_migrated_pipeline_plan_only_bridges_to_pronunciation_safe_operations() 
 def test_migrated_pipeline_run_emits_pronunciation_bridge_metadata() -> None:
     root = Path(__file__).resolve().parents[1]
     config = load_config(root / "configs" / "pipeline.example.yaml")
-    pronunciation_config = load_pronunciation_slider_config(root / "pronunciation_sliders.yaml")
+    hybrid_config = load_hybrid_config(root / "hybrid.yaml")
     pipeline = build_speech_distortion_pipeline(
         config,
-        pronunciation_config=pronunciation_config,
+        hybrid_config=hybrid_config,
         prefer_pronunciation_safe=True,
     )
     severity = build_stitching_slice(config).severity_profile
@@ -245,7 +246,48 @@ def test_migrated_pipeline_run_emits_pronunciation_bridge_metadata() -> None:
     rendered = pipeline.run(audio, "rabbit blue string", severity)
 
     assert rendered.samples
-    assert rendered.metadata["migration_mode"] == "pronunciation_safe_bridge"
+    assert rendered.metadata["migration_mode"] == "hybrid_distance_aware_runtime"
+    assert "trace_selected_grapheme_variant" in rendered.metadata
     assert float(rendered.metadata["pronunciation_similarity_score"]) >= float(
         rendered.metadata["pronunciation_similarity_threshold"]
     )
+
+
+def test_migrated_pipeline_timing_only_emits_pronunciation_timing_plan() -> None:
+    root = Path(__file__).resolve().parents[1]
+    config = load_config(root / "configs" / "pipeline.example.yaml")
+    hybrid_config = load_hybrid_config(root / "hybrid.yaml")
+    pipeline = build_speech_distortion_pipeline(
+        config,
+        hybrid_config=hybrid_config,
+        prefer_pronunciation_safe=True,
+    )
+    severity = build_planning_slice(config).severity_profile
+    audio = WavAudioReader().read(str(root / "yes_slow.wav"))
+
+    timing = pipeline.timing_only(audio, "rabbit blue string", severity)
+
+    assert hasattr(timing, "preserve_phone_order")
+    assert timing.preserve_phone_order is True
+
+
+def test_migrated_pipeline_edit_resynthesis_and_timbre_emit_outputs() -> None:
+    root = Path(__file__).resolve().parents[1]
+    config = load_config(root / "configs" / "pipeline.example.yaml")
+    hybrid_config = load_hybrid_config(root / "hybrid.yaml")
+    pipeline = build_speech_distortion_pipeline(
+        config,
+        hybrid_config=hybrid_config,
+        prefer_pronunciation_safe=True,
+    )
+    severity = build_planning_slice(config).severity_profile
+    audio = WavAudioReader().read(str(root / "yes_slow.wav"))
+
+    edited = pipeline.edit_only(audio, "rabbit blue string", severity)
+    fragments = pipeline.resynthesize_only(audio, "rabbit blue string", severity)
+    projected = pipeline.timbre_only(audio, "rabbit blue string", severity)
+
+    assert edited.metadata["editor_name"] == "heuristic_pronunciation_source_editor_v1"
+    assert isinstance(fragments, list)
+    assert isinstance(projected, list)
+    assert len(projected) == len(fragments)

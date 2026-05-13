@@ -117,6 +117,8 @@ class PronunciationSimilarityWeightsConfig:
 @dataclass
 class PronunciationSimilarityScoreConfig:
     range: list[float]
+    default_threshold: float
+    short_word_threshold: float
     weights: PronunciationSimilarityWeightsConfig
     repair_order: list[str]
 
@@ -128,6 +130,7 @@ class ShortWordModeConfig:
     max_deletions_per_word: int
     preserve_first_phone: bool
     preserve_primary_vowel_nucleus: bool
+    minimum_pronunciation_similarity: Optional[float] = None
 
 
 @dataclass
@@ -138,14 +141,13 @@ class SliderGuardrailsConfig:
 
 @dataclass
 class SliderConfig:
-    label: str
     default: float
-    user_description: str
     independence_rule: str
-    pronunciation_guardrails: SliderGuardrailsConfig
+    distance_inputs: dict[str, list[str]] = field(default_factory=dict)
+    estimation_rule: dict[str, list[str]] = field(default_factory=dict)
     generated_parameters: dict[str, object] = field(default_factory=dict)
-    allowed_examples_for_no: list[str] = field(default_factory=list)
-    disallowed_examples_for_no: list[str] = field(default_factory=list)
+    guardrails: SliderGuardrailsConfig = field(default_factory=SliderGuardrailsConfig)
+    example_candidates: dict[str, dict[str, list[str]]] = field(default_factory=dict)
 
 
 @dataclass
@@ -164,22 +166,75 @@ class OverrideModeConfig:
 @dataclass
 class AcceptanceTestConfig:
     name: str
-    word: str
-    phones: list[str]
-    controls: dict[str, float]
-    expected: str
+    word: str = ""
+    phones: list[str] = field(default_factory=list)
+    controls: dict[str, float] = field(default_factory=dict)
+    expected: str = ""
+    candidate_grapheme: Optional[str] = None
+    evidence: dict[str, object] = field(default_factory=dict)
+
+@dataclass
+class ControlModelConfig:
+    control_space: str
+    validation_space: str
+    distance_space: list[str] = field(default_factory=list)
+    render_space: str = ""
 
 
 @dataclass
-class PronunciationSliderConfig:
+class DistanceAndEmbeddingConfig:
+    enabled: bool
+    purpose: list[str] = field(default_factory=list)
+    normalization: dict[str, object] = field(default_factory=dict)
+    models: dict[str, dict[str, object]] = field(default_factory=dict)
+
+
+@dataclass
+class RoutingRuleConfig:
+    name: str
+    evidence: list[str] = field(default_factory=list)
+    output_slider: Optional[str] = None
+    output: list[str] = field(default_factory=list)
+
+
+@dataclass
+class MismatchDecompositionConfig:
+    enabled: bool
+    coordinate_system: str
+    inputs: list[str] = field(default_factory=list)
+    routing_rules: list[RoutingRuleConfig] = field(default_factory=list)
+    safety_rule: dict[str, object] = field(default_factory=dict)
+
+
+@dataclass
+class SliderEnvelopeEstimationConfig:
+    output_fields: list[str] = field(default_factory=list)
+    confidence_rules: dict[str, object] = field(default_factory=dict)
+
+
+@dataclass
+class TraceSchemaConfig:
+    enabled: bool
+    fields: list[str] = field(default_factory=list)
+
+
+@dataclass
+class HybridConfig:
     version: int
     kind: str
     name: str
     description: str
     global_constraints: GlobalConstraintsConfig
+    control_model: dict[str, ControlModelConfig]
+    distance_and_embedding_model: DistanceAndEmbeddingConfig
     pronunciation_skeleton: PronunciationSkeletonConfig
     pronunciation_similarity_score: PronunciationSimilarityScoreConfig
     sliders: dict[str, SliderConfig]
-    processing_pipeline: list[ProcessingStageConfig] = field(default_factory=list)
+    mismatch_decomposition: MismatchDecompositionConfig
+    slider_envelope_estimation: SliderEnvelopeEstimationConfig
+    processing_pipeline: list[str] = field(default_factory=list)
+    trace_schema: TraceSchemaConfig = field(
+        default_factory=lambda: TraceSchemaConfig(enabled=False, fields=[])
+    )
     override_modes: dict[str, OverrideModeConfig] = field(default_factory=dict)
     acceptance_tests: list[AcceptanceTestConfig] = field(default_factory=list)

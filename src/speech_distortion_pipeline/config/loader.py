@@ -9,24 +9,29 @@ from .schema import (
     AcceptanceTestConfig,
     AlignmentConfig,
     AnchorSelectionRulesConfig,
+    ControlModelConfig,
+    DistanceAndEmbeddingConfig,
     EditingConfig,
     GlobalConstraintsConfig,
+    HybridConfig,
+    MismatchDecompositionConfig,
     OverrideModeConfig,
     PhonologyConfig,
     PipelineConfig,
-    ProcessingStageConfig,
     PronunciationSimilarityScoreConfig,
     PronunciationSimilarityWeightsConfig,
     PronunciationSkeletonConfig,
-    PronunciationSliderConfig,
     RangeConfig,
     ResynthesisConfig,
+    RoutingRuleConfig,
     SeverityConfig,
     ShortWordModeConfig,
+    SliderEnvelopeEstimationConfig,
     SliderConfig,
     SliderGuardrailsConfig,
     StitchingConfig,
     TimbreConfig,
+    TraceSchemaConfig,
 )
 
 
@@ -125,39 +130,48 @@ def _parse_slider_guardrails(raw: Dict[str, Any]) -> SliderGuardrailsConfig:
     return SliderGuardrailsConfig(values=values, short_word_mode=short_word_mode)
 
 
-def load_pronunciation_slider_config(path: Any) -> PronunciationSliderConfig:
+def load_hybrid_config(path: Any) -> HybridConfig:
     raw = _load_yaml(Path(path))
 
     global_constraints = _require_mapping(raw.get("global_constraints"), "global_constraints")
+    control_model = _require_mapping(raw.get("control_model"), "control_model")
+    distance_model = _require_mapping(raw.get("distance_and_embedding_model"), "distance_and_embedding_model")
     skeleton = _require_mapping(raw.get("pronunciation_skeleton"), "pronunciation_skeleton")
     similarity = _require_mapping(raw.get("pronunciation_similarity_score"), "pronunciation_similarity_score")
     sliders_raw = _require_mapping(raw.get("sliders"), "sliders")
+    mismatch = _require_mapping(raw.get("mismatch_decomposition"), "mismatch_decomposition")
+    slider_envelope = _require_mapping(raw.get("slider_envelope_estimation"), "slider_envelope_estimation")
+    trace_schema = _require_mapping(raw.get("trace_schema"), "trace_schema")
 
     slider_configs: Dict[str, SliderConfig] = {}
     for slider_name, slider_value in sliders_raw.items():
         slider_mapping = _require_mapping(slider_value, "sliders.{0}".format(slider_name))
         slider_configs[str(slider_name)] = SliderConfig(
-            label=str(slider_mapping["label"]),
             default=float(slider_mapping["default"]),
-            user_description=str(slider_mapping["user_description"]),
             independence_rule=str(slider_mapping["independence_rule"]),
-            pronunciation_guardrails=_parse_slider_guardrails(
-                _require_mapping(slider_mapping.get("pronunciation_guardrails"), "pronunciation_guardrails")
-            ),
+            distance_inputs={
+                str(key): [str(item) for item in value]
+                for key, value in _require_mapping(slider_mapping.get("distance_inputs", {}), "distance_inputs").items()
+            },
+            estimation_rule={
+                str(key): [str(item) for item in value]
+                for key, value in _require_mapping(slider_mapping.get("estimation_rule", {}), "estimation_rule").items()
+            },
             generated_parameters=dict(_require_mapping(slider_mapping.get("generated_parameters"), "generated_parameters")),
-            allowed_examples_for_no=[str(item) for item in slider_mapping.get("allowed_examples_for_no", [])],
-            disallowed_examples_for_no=[str(item) for item in slider_mapping.get("disallowed_examples_for_no", [])],
+            guardrails=_parse_slider_guardrails(
+                _require_mapping(slider_mapping.get("guardrails", {}), "guardrails")
+            ),
+            example_candidates={
+                str(word): {
+                    str(key): [str(item) for item in value]
+                    for key, value in _require_mapping(candidate_mapping, "example_candidates").items()
+                }
+                for word, candidate_mapping in _require_mapping(
+                    slider_mapping.get("example_candidates", {}),
+                    "example_candidates",
+                ).items()
+            },
         )
-
-    processing_pipeline = [
-        ProcessingStageConfig(
-            id=str(item["id"]),
-            outputs=[str(output) for output in item.get("outputs", [])],
-            uses=[str(entry) for entry in item.get("uses", [])],
-            condition=str(item["condition"]) if item.get("condition") is not None else None,
-        )
-        for item in raw.get("processing_pipeline", [])
-    ]
 
     override_modes = {
         str(name): OverrideModeConfig(values=dict(_require_mapping(value, "override_modes.{0}".format(name))))
@@ -167,18 +181,46 @@ def load_pronunciation_slider_config(path: Any) -> PronunciationSliderConfig:
     acceptance_tests = [
         AcceptanceTestConfig(
             name=str(item["name"]),
-            word=str(item["word"]),
+            word=str(item.get("word", "")),
             phones=[str(phone) for phone in item.get("phones", [])],
             controls={str(key): float(value) for key, value in _require_mapping(item.get("controls", {}), "controls").items()},
-            expected=str(item["expected"]),
+            expected=str(item.get("expected", "")),
+            candidate_grapheme=str(item["candidate_grapheme"]) if item.get("candidate_grapheme") is not None else None,
+            evidence={
+                str(key): value
+                for key, value in _require_mapping(item.get("evidence", {}), "evidence").items()
+            },
         )
         for item in raw.get("acceptance_tests", [])
     ]
 
     anchor_rules = _require_mapping(skeleton.get("anchor_selection_rules"), "anchor_selection_rules")
     weights = _require_mapping(similarity.get("weights"), "weights")
+    control_configs = {
+        str(name): ControlModelConfig(
+            control_space=str(value["control_space"]),
+            validation_space=str(value["validation_space"]),
+            distance_space=[str(item) for item in value.get("distance_space", [])],
+            render_space=str(value.get("render_space", "")),
+        )
+        for name, value in control_model.items()
+    }
+    distance_model_values = {
+        str(name): dict(_require_mapping(value, name))
+        for name, value in distance_model.items()
+        if isinstance(value, dict) and name not in {"enabled", "purpose", "normalization"}
+    }
+    routing_rules = [
+        RoutingRuleConfig(
+            name=str(item["name"]),
+            evidence=[str(value) for value in item.get("evidence", [])],
+            output_slider=str(item["output_slider"]) if item.get("output_slider") is not None else None,
+            output=[str(value) for value in item.get("output", [])],
+        )
+        for item in mismatch.get("routing_rules", [])
+    ]
 
-    return PronunciationSliderConfig(
+    return HybridConfig(
         version=int(raw["version"]),
         kind=str(raw["kind"]),
         name=str(raw["name"]),
@@ -195,8 +237,15 @@ def load_pronunciation_slider_config(path: Any) -> PronunciationSliderConfig:
             max_total_duration_drift_ratio=float(global_constraints["max_total_duration_drift_ratio"]),
             random_seed=int(global_constraints["random_seed"]),
         ),
+        control_model=control_configs,
+        distance_and_embedding_model=DistanceAndEmbeddingConfig(
+            enabled=bool(distance_model["enabled"]),
+            purpose=[str(item) for item in distance_model.get("purpose", [])],
+            normalization=dict(_require_mapping(distance_model.get("normalization", {}), "normalization")),
+            models=distance_model_values,
+        ),
         pronunciation_skeleton=PronunciationSkeletonConfig(
-            extract=[str(item) for item in skeleton.get("extract", [])],
+            extract=[str(item) for item in skeleton.get("fields", skeleton.get("extract", []))],
             anchor_selection_rules=AnchorSelectionRulesConfig(
                 always_anchor_primary_vowel=bool(anchor_rules["always_anchor_primary_vowel"]),
                 always_anchor_first_content_consonant=bool(anchor_rules["always_anchor_first_content_consonant"]),
@@ -208,6 +257,10 @@ def load_pronunciation_slider_config(path: Any) -> PronunciationSliderConfig:
         ),
         pronunciation_similarity_score=PronunciationSimilarityScoreConfig(
             range=[float(value) for value in similarity.get("range", [])],
+            default_threshold=float(similarity.get("default_threshold", global_constraints["minimum_pronunciation_similarity"])),
+            short_word_threshold=float(
+                similarity.get("short_word_threshold", global_constraints["minimum_pronunciation_similarity_short_word"])
+            ),
             weights=PronunciationSimilarityWeightsConfig(
                 anchor_phone_preservation=float(weights["anchor_phone_preservation"]),
                 vowel_nucleus_similarity=float(weights["vowel_nucleus_similarity"]),
@@ -218,7 +271,22 @@ def load_pronunciation_slider_config(path: Any) -> PronunciationSliderConfig:
             repair_order=[str(item) for item in similarity.get("repair_order", [])],
         ),
         sliders=slider_configs,
-        processing_pipeline=processing_pipeline,
+        mismatch_decomposition=MismatchDecompositionConfig(
+            enabled=bool(mismatch["enabled"]),
+            coordinate_system=str(mismatch["coordinate_system"]),
+            inputs=[str(item) for item in mismatch.get("inputs", [])],
+            routing_rules=routing_rules,
+            safety_rule=dict(_require_mapping(mismatch.get("safety_rule", {}), "safety_rule")),
+        ),
+        slider_envelope_estimation=SliderEnvelopeEstimationConfig(
+            output_fields=[str(item) for item in slider_envelope.get("output_fields", [])],
+            confidence_rules=dict(_require_mapping(slider_envelope.get("confidence_rules", {}), "confidence_rules")),
+        ),
+        processing_pipeline=[str(item) for item in raw.get("processing_pipeline", [])],
+        trace_schema=TraceSchemaConfig(
+            enabled=bool(trace_schema.get("enabled", False)),
+            fields=[str(item) for item in trace_schema.get("fields", [])],
+        ),
         override_modes=override_modes,
         acceptance_tests=acceptance_tests,
     )

@@ -4,7 +4,7 @@ from .budget import (
     HeuristicPronunciationTimingPlanner,
     PronunciationTimingPlanner,
 )
-from .factory import build_duration_budget_manager, build_pronunciation_timing_planner
+from .factory import build_duration_budget_manager, build_hybrid_timing_planner
 
 __all__ = [
     "DurationBudgetManager",
@@ -12,5 +12,5 @@ __all__ = [
     "HeuristicPronunciationTimingPlanner",
     "PronunciationTimingPlanner",
     "build_duration_budget_manager",
-    "build_pronunciation_timing_planner",
+    "build_hybrid_timing_planner",
 ]

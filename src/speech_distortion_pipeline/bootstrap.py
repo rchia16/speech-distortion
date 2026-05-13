@@ -4,7 +4,7 @@ from dataclasses import dataclass
 from typing import Optional, Union
 
 from speech_distortion_pipeline.alignment import Aligner, build_aligner
-from speech_distortion_pipeline.config import AlignmentConfig, PhonologyConfig, PipelineConfig, PronunciationSliderConfig
+from speech_distortion_pipeline.config import AlignmentConfig, HybridConfig, PhonologyConfig, PipelineConfig
 from speech_distortion_pipeline.editing import (
     PronunciationSourceEditor,
     SourceSegmentEditor,
@@ -22,9 +22,9 @@ from speech_distortion_pipeline.phonology import (
 )
 from speech_distortion_pipeline.planning import (
     ErrorPlanner,
-    PronunciationPlanner,
+    HybridPlanner,
     build_error_planner,
-    build_pronunciation_planner,
+    build_hybrid_planner,
     build_severity_profile_from_config,
 )
 from speech_distortion_pipeline.resynthesis import (
@@ -41,7 +41,7 @@ from speech_distortion_pipeline.timing import (
     DurationBudgetManager,
     PronunciationTimingPlanner,
     build_duration_budget_manager,
-    build_pronunciation_timing_planner,
+    build_hybrid_timing_planner,
 )
 from speech_distortion_pipeline.orchestration import SpeechDistortionPipeline
 
@@ -251,15 +251,15 @@ def build_timbre_slice(config: PipelineConfig) -> TimbreSlice:
 
 
 @dataclass
-class PronunciationPlanningSlice:
-    config: PronunciationSliderConfig
+class HybridPlanningSlice:
+    config: HybridConfig
     aligner: Aligner
     g2p: GraphemeToPhoneme
     feature_extractor: FeatureExtractor
-    planner: PronunciationPlanner
+    planner: HybridPlanner
 
 
-def build_pronunciation_planning_slice(config: PronunciationSliderConfig) -> PronunciationPlanningSlice:
+def build_hybrid_planning_slice(config: HybridConfig) -> HybridPlanningSlice:
     alignment = AlignmentConfig(
         runtime_backend="torchaudio_ctc",
         offline_backend="mfa",
@@ -271,51 +271,51 @@ def build_pronunciation_planning_slice(config: PronunciationSliderConfig) -> Pro
         compute_complexity=False,
     )
     g2p = build_grapheme_to_phoneme(phonology)
-    return PronunciationPlanningSlice(
+    return HybridPlanningSlice(
         config=config,
         aligner=build_aligner(alignment),
         g2p=g2p,
         feature_extractor=build_feature_extractor(phonology, g2p),
-        planner=build_pronunciation_planner(config),
+        planner=build_hybrid_planner(config, g2p),
     )
 
 
 @dataclass
-class PronunciationTimingSlice:
-    config: PronunciationSliderConfig
+class HybridTimingSlice:
+    config: HybridConfig
     aligner: Aligner
     g2p: GraphemeToPhoneme
     feature_extractor: FeatureExtractor
-    planner: PronunciationPlanner
+    planner: HybridPlanner
     timing_planner: PronunciationTimingPlanner
 
 
-def build_pronunciation_timing_slice(config: PronunciationSliderConfig) -> PronunciationTimingSlice:
-    planning = build_pronunciation_planning_slice(config)
-    return PronunciationTimingSlice(
+def build_hybrid_timing_slice(config: HybridConfig) -> HybridTimingSlice:
+    planning = build_hybrid_planning_slice(config)
+    return HybridTimingSlice(
         config=config,
         aligner=planning.aligner,
         g2p=planning.g2p,
         feature_extractor=planning.feature_extractor,
         planner=planning.planner,
-        timing_planner=build_pronunciation_timing_planner(config),
+        timing_planner=build_hybrid_timing_planner(config),
     )
 
 
 @dataclass
-class PronunciationEditingSlice:
-    config: PronunciationSliderConfig
+class HybridEditingSlice:
+    config: HybridConfig
     aligner: Aligner
     g2p: GraphemeToPhoneme
     feature_extractor: FeatureExtractor
-    planner: PronunciationPlanner
+    planner: HybridPlanner
     timing_planner: PronunciationTimingPlanner
     source_editor: PronunciationSourceEditor
 
 
-def build_pronunciation_editing_slice(config: PronunciationSliderConfig) -> PronunciationEditingSlice:
-    timing = build_pronunciation_timing_slice(config)
-    return PronunciationEditingSlice(
+def build_hybrid_editing_slice(config: HybridConfig) -> HybridEditingSlice:
+    timing = build_hybrid_timing_slice(config)
+    return HybridEditingSlice(
         config=config,
         aligner=timing.aligner,
         g2p=timing.g2p,
@@ -327,20 +327,20 @@ def build_pronunciation_editing_slice(config: PronunciationSliderConfig) -> Pron
 
 
 @dataclass
-class PronunciationResynthesisSlice:
-    config: PronunciationSliderConfig
+class HybridResynthesisSlice:
+    config: HybridConfig
     aligner: Aligner
     g2p: GraphemeToPhoneme
     feature_extractor: FeatureExtractor
-    planner: PronunciationPlanner
+    planner: HybridPlanner
     timing_planner: PronunciationTimingPlanner
     source_editor: PronunciationSourceEditor
     fragment_synthesizer: PronunciationFragmentSynthesizer
 
 
-def build_pronunciation_resynthesis_slice(config: PronunciationSliderConfig) -> PronunciationResynthesisSlice:
-    editing = build_pronunciation_editing_slice(config)
-    return PronunciationResynthesisSlice(
+def build_hybrid_resynthesis_slice(config: HybridConfig) -> HybridResynthesisSlice:
+    editing = build_hybrid_editing_slice(config)
+    return HybridResynthesisSlice(
         config=config,
         aligner=editing.aligner,
         g2p=editing.g2p,
@@ -353,21 +353,21 @@ def build_pronunciation_resynthesis_slice(config: PronunciationSliderConfig) -> 
 
 
 @dataclass
-class PronunciationTimbreSlice:
-    config: PronunciationSliderConfig
+class HybridTimbreSlice:
+    config: HybridConfig
     aligner: Aligner
     g2p: GraphemeToPhoneme
     feature_extractor: FeatureExtractor
-    planner: PronunciationPlanner
+    planner: HybridPlanner
     timing_planner: PronunciationTimingPlanner
     source_editor: PronunciationSourceEditor
     fragment_synthesizer: PronunciationFragmentSynthesizer
     timbre_projector: TimbreProjector
 
 
-def build_pronunciation_timbre_slice(config: PronunciationSliderConfig) -> PronunciationTimbreSlice:
-    resynthesis = build_pronunciation_resynthesis_slice(config)
-    return PronunciationTimbreSlice(
+def build_hybrid_timbre_slice(config: HybridConfig) -> HybridTimbreSlice:
+    resynthesis = build_hybrid_resynthesis_slice(config)
+    return HybridTimbreSlice(
         config=config,
         aligner=resynthesis.aligner,
         g2p=resynthesis.g2p,
@@ -381,12 +381,12 @@ def build_pronunciation_timbre_slice(config: PronunciationSliderConfig) -> Pronu
 
 
 @dataclass
-class PronunciationStitchingSlice:
-    config: PronunciationSliderConfig
+class HybridStitchingSlice:
+    config: HybridConfig
     aligner: Aligner
     g2p: GraphemeToPhoneme
     feature_extractor: FeatureExtractor
-    planner: PronunciationPlanner
+    planner: HybridPlanner
     timing_planner: PronunciationTimingPlanner
     source_editor: PronunciationSourceEditor
     fragment_synthesizer: PronunciationFragmentSynthesizer
@@ -394,9 +394,9 @@ class PronunciationStitchingSlice:
     assembler: AudioAssembler
 
 
-def build_pronunciation_stitching_slice(config: PronunciationSliderConfig) -> PronunciationStitchingSlice:
-    timbre = build_pronunciation_timbre_slice(config)
-    return PronunciationStitchingSlice(
+def build_hybrid_stitching_slice(config: HybridConfig) -> HybridStitchingSlice:
+    timbre = build_hybrid_timbre_slice(config)
+    return HybridStitchingSlice(
         config=timbre.config,
         aligner=timbre.aligner,
         g2p=timbre.g2p,
@@ -411,7 +411,7 @@ def build_pronunciation_stitching_slice(config: PronunciationSliderConfig) -> Pr
 
 
 def build_slider_controls(
-    config: PronunciationSliderConfig, **overrides: Optional[Union[float, bool]]
+    config: HybridConfig, **overrides: Optional[Union[float, bool, dict[str, float]]]
 ) -> SliderControls:
     allow_full_gibberish = overrides.get("allow_full_gibberish")
     return SliderControls(
@@ -425,6 +425,7 @@ def build_slider_controls(
             if allow_full_gibberish is not None
             else bool(config.global_constraints.allow_full_gibberish)
         ),
+        distance_overrides=dict(overrides.get("distance_overrides", {}) or {}),
     )
 
 
@@ -455,26 +456,41 @@ def map_severity_to_slider_controls(severity: SeverityProfile) -> SliderControls
     )
 
 
-def run_pronunciation_acceptance_report(
-    config: PronunciationSliderConfig, audio_path: str
+def run_hybrid_acceptance_report(
+    config: HybridConfig, audio_path: str
 ) -> PronunciationAcceptanceReport:
     audio = WavAudioReader().read(audio_path)
-    planning = build_pronunciation_planning_slice(config)
-    timing = build_pronunciation_timing_slice(config)
+    planning = build_hybrid_planning_slice(config)
+    timing = build_hybrid_timing_slice(config)
     case_results = []
 
     for case in config.acceptance_tests:
-        alignment = planning.aligner.align(audio, case.word)
+        target_word = case.word or "yes"
+        alignment = planning.aligner.align(audio, target_word)
         graph = planning.feature_extractor.build_phone_graph(alignment)
-        controls = build_slider_controls(config, **case.controls)
-        plan = planning.planner.plan(graph, controls)
+        controls = build_slider_controls(
+            config,
+            **case.controls,
+            distance_overrides={
+                str(key): float(value)
+                for key, value in case.evidence.items()
+                if isinstance(value, (float, int, bool))
+            },
+        )
+        plan = planning.planner.plan(graph, controls, audio=audio)
         timing_plan = timing.timing_planner.build(graph, plan)
+        passed = plan.similarity.passed and timing_plan.preserve_phone_order
+        if case.expected == "increase_timing_instability_not_jibberish_or_clarity":
+            passed = (
+                plan.slider_estimates["timing_instability"].value > plan.slider_estimates["jibberish"].value
+                and plan.slider_estimates["timing_instability"].value > plan.slider_estimates["clarity"].value
+            )
         case_results.append(
             AcceptanceCaseResult(
                 name=case.name,
-                word=case.word,
+                word=target_word,
                 expected=case.expected,
-                passed=plan.similarity.passed and timing_plan.preserve_phone_order,
+                passed=passed,
                 similarity_score=plan.similarity.score,
                 similarity_threshold=plan.similarity.threshold,
                 operation_count=len(plan.operations),
@@ -489,11 +505,11 @@ def run_pronunciation_acceptance_report(
 def build_speech_distortion_pipeline(
     config: PipelineConfig,
     *,
-    pronunciation_config: Optional[PronunciationSliderConfig] = None,
+    hybrid_config: Optional[HybridConfig] = None,
     prefer_pronunciation_safe: bool = False,
 ) -> SpeechDistortionPipeline:
     stitching = build_stitching_slice(config)
-    if pronunciation_config is None:
+    if hybrid_config is None:
         return SpeechDistortionPipeline(
             aligner=stitching.aligner,
             feature_extractor=stitching.feature_extractor,
@@ -507,7 +523,7 @@ def build_speech_distortion_pipeline(
             prefer_pronunciation_safe=False,
         )
 
-    pronunciation = build_pronunciation_stitching_slice(pronunciation_config)
+    pronunciation = build_hybrid_stitching_slice(hybrid_config)
     return SpeechDistortionPipeline(
         aligner=stitching.aligner,
         feature_extractor=stitching.feature_extractor,

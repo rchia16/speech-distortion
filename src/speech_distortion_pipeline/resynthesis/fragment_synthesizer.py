@@ -302,15 +302,37 @@ class HeuristicPronunciationFragmentSynthesizer(HeuristicFragmentSynthesizer):
     """Pronunciation-aware fragment synthesizer for slider-driven symbolic edits."""
 
     synthesizer_name: str = "heuristic_pronunciation_fragment_synthesizer_v1"
+    tts_synthesizer_name: str = "tts_pronunciation_fragment_synthesizer_v1"
+    kokoro_synthesizer_name: str = "kokoro_pronunciation_fragment_synthesizer_v1"
 
     def synthesize(
         self, audio: AudioBuffer, graph: PhoneGraph, plan: PronunciationSafePlan, timing: TimingInstabilityPlan
     ) -> list[AudioSegment]:
         node_map = {node.index: node for node in graph.nodes}
+        nodes_by_word = self._nodes_by_word(graph)
         clarity_mix = float(plan.clarity_plan.parameters.get("breath_noise_mix", 0.0))
         fricative_smearing = float(plan.clarity_plan.parameters.get("fricative_smearing", 0.0))
         timing_budget_map = {budget.window_start_phone_index: budget for budget in timing.budgets}
         fragments: List[AudioSegment] = []
+        covered_word_indices = set()
+
+        for candidate in plan.selected_candidates:
+            if not candidate.accepted or candidate.grapheme == candidate.word:
+                continue
+            word_nodes = nodes_by_word.get(candidate.word_index, [])
+            if not word_nodes:
+                continue
+            fragment = self._synthesize_word_variant_fragment(
+                audio=audio,
+                word_nodes=word_nodes,
+                candidate=candidate,
+                clarity_mix=clarity_mix,
+                fricative_smearing=fricative_smearing,
+            )
+            if fragment is None:
+                continue
+            fragments.append(fragment)
+            covered_word_indices.add(candidate.word_index)
 
         for operation in plan.operations:
             if operation.edit_type not in {EditType.SUBSTITUTE, EditType.DISTORTED_SUBSTITUTE, EditType.ADD}:
@@ -321,6 +343,8 @@ class HeuristicPronunciationFragmentSynthesizer(HeuristicFragmentSynthesizer):
             target_index = operation.target_phone_indices[0]
             target_node = node_map.get(target_index)
             if target_node is None:
+                continue
+            if target_node.word_index in covered_word_indices:
                 continue
 
             start_sec = float(target_node.start_sec or 0.0)
@@ -358,6 +382,105 @@ class HeuristicPronunciationFragmentSynthesizer(HeuristicFragmentSynthesizer):
 
         return fragments
 
+    def _nodes_by_word(self, graph: PhoneGraph) -> Dict[int, List[PhoneNode]]:
+        nodes_by_word: Dict[int, List[PhoneNode]] = {}
+        for node in graph.nodes:
+            nodes_by_word.setdefault(node.word_index, []).append(node)
+        return nodes_by_word
+
+    def _synthesize_word_variant_fragment(
+        self,
+        audio: AudioBuffer,
+        word_nodes: List[PhoneNode],
+        candidate,
+        clarity_mix: float,
+        fricative_smearing: float,
+    ) -> Optional[AudioSegment]:
+        if not word_nodes:
+            return None
+        start_sec = min(float(node.start_sec or 0.0) for node in word_nodes)
+        end_sec = max(float(node.end_sec or start_sec + 0.06) for node in word_nodes)
+        duration_sec = max(0.04, end_sec - start_sec)
+        samples, source_name = self._render_word_variant(
+            text=candidate.grapheme,
+            phones=list(candidate.phones),
+            sample_rate_hz=audio.sample_rate_hz,
+            duration_sec=duration_sec,
+            seed=(candidate.word_index * 97) + len(candidate.grapheme),
+        )
+        if not samples:
+            return None
+        anchor_node = word_nodes[0]
+        shaped = self._shape_fragment(samples, clarity_mix, fricative_smearing, anchor_node, distorted=False)
+        return AudioSegment(
+            start_sec=start_sec,
+            end_sec=end_sec,
+            samples=shaped,
+            label="word_variant:{0}".format(candidate.grapheme),
+            source=source_name,
+        )
+
+    def _render_word_variant(
+        self,
+        text: str,
+        phones: List[str],
+        sample_rate_hz: int,
+        duration_sec: float,
+        seed: int,
+    ) -> Tuple[List[float], str]:
+        source_name = self.synthesizer_name
+        samples: List[float] = []
+        audio_template = AudioBuffer(samples=[0.0], sample_rate_hz=sample_rate_hz)
+
+        if phones:
+            try:
+                from speech_distortion_pipeline.resynthesis.phoneme_render_backend import (
+                    DEFAULT_KOKORO_VOICE,
+                    PHONEME_RENDER_BACKEND_KOKORO,
+                    render_with_phoneme_backend,
+                )
+
+                rendered = render_with_phoneme_backend(
+                    audio_template,
+                    phones,
+                    backend=PHONEME_RENDER_BACKEND_KOKORO,
+                    backend_voice=DEFAULT_KOKORO_VOICE,
+                )
+                samples = rendered.samples.astype("float32").tolist()
+                source_name = self.kokoro_synthesizer_name
+            except Exception:
+                samples = []
+
+        if not samples and shutil.which("conda"):
+            coqui = CoquiFragmentSynthesizer()
+            try:
+                samples = coqui._render_with_coqui(text, sample_rate_hz)
+                source_name = coqui.synthesizer_name if samples else source_name
+            except Exception:
+                samples = []
+
+        if not samples and shutil.which("say"):
+            say = SayFragmentSynthesizer()
+            try:
+                samples = say._render_speech(text, sample_rate_hz)
+                source_name = say.synthesizer_name if samples else source_name
+            except Exception:
+                samples = []
+
+        if not samples:
+            samples = self._render_phone_sequence(
+                phones=phones or ["AH"],
+                sample_rate_hz=sample_rate_hz,
+                duration_sec=duration_sec,
+                distorted=False,
+                seed=seed,
+            )
+            source_name = self.synthesizer_name
+
+        target_samples = max(1, int(round(duration_sec * sample_rate_hz)))
+        samples = self._resample(samples, target_samples)
+        return samples, source_name
+
     def _phones_for_pronunciation_operation(self, target_node: PhoneNode, operation) -> List[str]:
         if operation.edit_type == EditType.ADD:
             phones = list(operation.inserted_phones)
@@ -394,6 +517,25 @@ class HeuristicPronunciationFragmentSynthesizer(HeuristicFragmentSynthesizer):
             end = min(len(samples), index + radius + 1)
             window = samples[start:end]
             output.append(sum(window) / float(len(window)))
+        return output
+
+    def _resample(self, samples: List[float], target_length: int) -> List[float]:
+        if target_length <= 0:
+            return []
+        if not samples:
+            return [0.0] * target_length
+        if len(samples) == target_length:
+            return list(samples)
+        if len(samples) == 1:
+            return [samples[0]] * target_length
+        output: List[float] = []
+        scale = float(len(samples) - 1) / float(max(target_length - 1, 1))
+        for index in range(target_length):
+            position = index * scale
+            left = int(position)
+            right = min(left + 1, len(samples) - 1)
+            mix = position - left
+            output.append((samples[left] * (1.0 - mix)) + (samples[right] * mix))
         return output
 
 

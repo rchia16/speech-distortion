@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from speech_distortion_pipeline.config import PronunciationSliderConfig
+from speech_distortion_pipeline.config import HybridConfig
 
 from .budget import (
     DurationBudgetManager,
@@ -14,5 +14,5 @@ def build_duration_budget_manager() -> DurationBudgetManager:
     return HeuristicDurationBudgetManager()
 
 
-def build_pronunciation_timing_planner(config: PronunciationSliderConfig) -> PronunciationTimingPlanner:
+def build_hybrid_timing_planner(config: HybridConfig) -> PronunciationTimingPlanner:
     return HeuristicPronunciationTimingPlanner(config=config)

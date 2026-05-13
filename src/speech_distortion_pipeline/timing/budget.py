@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Dict, List, Protocol
 
-from speech_distortion_pipeline.config import PronunciationSliderConfig
+from speech_distortion_pipeline.config import HybridConfig
 from speech_distortion_pipeline.models import (
     DurationBudget,
     EditPlan,
@@ -120,12 +120,14 @@ class PronunciationTimingPlanner(Protocol):
 
 @dataclass
 class HeuristicPronunciationTimingPlanner:
-    config: PronunciationSliderConfig
+    config: HybridConfig
     planner_name: str = "heuristic_pronunciation_timing_planner_v1"
 
     def build(self, graph: PhoneGraph, plan: PronunciationSafePlan) -> TimingInstabilityPlan:
-        controls = plan.controls
-        guardrails = self.config.sliders["timing_instability"].pronunciation_guardrails.values
+        estimate = plan.slider_estimates.get("timing_instability")
+        routed_value = estimate.value if estimate is not None else plan.controls.timing_instability
+        timing_params = plan.generated_parameters.get("timing_instability", {})
+        guardrails = self.config.sliders["timing_instability"].guardrails.values
         by_word: Dict[int, List[PhoneNode]] = {}
         for node in graph.nodes:
             by_word.setdefault(node.word_index, []).append(node)
@@ -143,7 +145,7 @@ class HeuristicPronunciationTimingPlanner:
                 self.config.global_constraints.max_total_duration_drift_ratio,
             )
         )
-        duration_scale = max_drift * controls.timing_instability
+        duration_scale = max_drift * routed_value
 
         for skeleton in plan.skeletons:
             nodes = by_word.get(skeleton.word_index, [])
@@ -152,7 +154,9 @@ class HeuristicPronunciationTimingPlanner:
             start_index = nodes[0].index
             end_index = nodes[-1].index
             word_duration = sum(self._node_duration(node) for node in nodes)
-            requested = round(word_duration * duration_scale, 4)
+            duration_jitter = float(timing_params.get("phone_duration_jitter", routed_value * 0.35))
+            syllable_jitter = float(timing_params.get("syllable_duration_jitter", routed_value * 0.25))
+            requested = round(word_duration * min(max_drift, duration_scale + (duration_jitter * 0.08) + (syllable_jitter * 0.06)), 4)
             compensated = round(min(requested, word_duration * 0.8), 4)
             budgets.append(
                 DurationBudget(
@@ -166,12 +170,17 @@ class HeuristicPronunciationTimingPlanner:
             total_requested += requested
             total_compensated += compensated
 
-            if controls.timing_instability >= 0.45:
+            micro_probability = float(timing_params.get("micro_stutter_probability", max(0.0, routed_value - 0.45)))
+            onset_probability = float(timing_params.get("onset_repeat_probability", max(0.0, routed_value - 0.55)))
+            pause_probability = float(timing_params.get("pause_insertion_probability", max(0.0, routed_value - 0.30)))
+
+            if micro_probability > 0.0:
                 micro_stutters.append(start_index)
-            if controls.timing_instability >= 0.55:
+            if onset_probability > 0.0:
                 repeat_limit = int(guardrails.get("max_onset_repeats", 2))
-                onset_repeats.extend([start_index] * min(1, repeat_limit))
-            if controls.timing_instability >= 0.30:
+                repeat_count = min(repeat_limit, max(1, int(round(onset_probability * repeat_limit))))
+                onset_repeats.extend([start_index] * repeat_count)
+            if pause_probability > 0.0:
                 pause_after.append(end_index)
 
         return TimingInstabilityPlan(

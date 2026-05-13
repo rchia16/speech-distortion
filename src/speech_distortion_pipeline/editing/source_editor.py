@@ -321,6 +321,10 @@ class HeuristicPronunciationSourceEditor(HeuristicSourceSegmentEditor):
                 "timing_onset_repeat_count": str(len(timing.onset_repeat_phone_indices)),
                 "pronunciation_similarity_score": "{0:.4f}".format(plan.similarity.score),
                 "pronunciation_similarity_threshold": "{0:.4f}".format(plan.similarity.threshold),
+                "trace_selected_grapheme_variant": (
+                    plan.trace.selected_grapheme_variant if plan.trace is not None else ""
+                ),
+                "trace_selected_phones": " ".join(plan.trace.selected_phones) if plan.trace is not None else "",
             },
         )
 

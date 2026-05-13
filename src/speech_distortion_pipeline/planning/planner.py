@@ -1,12 +1,18 @@
 from __future__ import annotations
 
 import random
+import re
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Protocol
 
-from speech_distortion_pipeline.config import PronunciationSliderConfig
+from speech_distortion_pipeline.config import HybridConfig
 from speech_distortion_pipeline.models import (
+    AudioBuffer,
+    CandidateScore,
     ClarityPlan,
+    DecisionTrace,
+    DistanceEvidenceBundle,
+    DistanceSignal,
     EditOperation,
     EditPlan,
     EditType,
@@ -17,12 +23,18 @@ from speech_distortion_pipeline.models import (
     PronunciationSkeleton,
     ProtectionMap,
     RepairAction,
+    RoutingDecision,
     SeverityProfile,
     SimilarityComponents,
     SliderControls,
+    SliderEstimate,
     WordComplexity,
 )
+from speech_distortion_pipeline.phonology import GraphemeToPhoneme
+from .evidence import HeuristicDistanceEvidenceComputer
 
+PHONE_THOLD = 1.0 # 0.55
+MAX_CANDIDATES_0 = 12
 
 class ErrorPlanner(Protocol):
     """Produces phone-level edit operations from phonological structure."""
@@ -259,30 +271,87 @@ class HeuristicErrorPlanner:
         return phone in {"AE", "AH", "EH", "IH", "IY", "OW", "UW", "AY", "EY", "OY", "AW", "ER"}
 
 
-class PronunciationPlanner(Protocol):
-    """Builds pronunciation-safe symbolic plans from slider controls."""
+class HybridPlanner(Protocol):
+    """Builds pronunciation-safe hybrid plans from slider controls and distance evidence."""
 
-    def plan(self, graph: PhoneGraph, controls: SliderControls) -> PronunciationSafePlan:
+    def plan(
+        self,
+        graph: PhoneGraph,
+        controls: SliderControls,
+        audio: Optional[AudioBuffer] = None,
+    ) -> PronunciationSafePlan:
         raise NotImplementedError
 
 
 @dataclass
-class HeuristicPronunciationPlanner:
-    config: PronunciationSliderConfig
-    planner_name: str = "heuristic_pronunciation_safe_planner_v1"
+class HeuristicHybridPlanner:
+    config: HybridConfig
+    g2p: GraphemeToPhoneme
+    planner_name: str = "heuristic_hybrid_planner_v1"
 
     def __post_init__(self) -> None:
         self._rng = random.Random(self.config.global_constraints.random_seed)
+        self._evidence_computer = HeuristicDistanceEvidenceComputer(config=self.config)
 
-    def plan(self, graph: PhoneGraph, controls: SliderControls) -> PronunciationSafePlan:
+    def plan(
+        self,
+        graph: PhoneGraph,
+        controls: SliderControls,
+        audio: Optional[AudioBuffer] = None,
+    ) -> PronunciationSafePlan:
         skeletons = self._build_skeletons(graph)
         protection_maps = [self._build_protection_map(skeleton) for skeleton in skeletons]
-        operations = self._plan_jibberish(graph, skeletons, controls)
-        clarity_plan = self._build_clarity_plan(controls)
+        provisional_jibberish_estimate = SliderEstimate(
+            value=controls.jibberish,
+            confidence=0.85,
+            evidence_sources=["control_prior"],
+            routing_rule="control_prior",
+        )
+
+        candidate_seed_map: Dict[int, List[CandidateScore]] = {}
+        for skeleton in skeletons:
+            candidate_seed_map[skeleton.word_index] = self._build_candidate_scores(
+                skeleton,
+                provisional_jibberish_estimate,
+                controls,
+            )
+        evidence_bundle = self._evidence_computer.compute(
+            graph=graph,
+            skeletons=skeletons,
+            candidates_by_word=candidate_seed_map,
+            controls=controls,
+            audio=audio,
+        )
+        distance_evidence = evidence_bundle.signals
+        slider_estimates = self._evidence_computer.estimate_sliders(evidence_bundle)
+
+        candidates: List[CandidateScore] = []
+        selected_candidates: List[CandidateScore] = []
+        operations: List[EditOperation] = []
+        for skeleton in skeletons:
+            word_candidates = self._build_candidate_scores(
+                skeleton,
+                slider_estimates["jibberish"],
+                controls,
+            )
+            candidates.extend(word_candidates)
+            selected = self._select_candidate(skeleton, word_candidates, slider_estimates["jibberish"])
+            selected_candidates.append(selected)
+            operations.extend(
+                self._build_operations_for_candidate(
+                    graph=graph,
+                    skeleton=skeleton,
+                    candidate=selected,
+                    controls=controls,
+                    jibberish_estimate=slider_estimates["jibberish"],
+                )
+            )
+
+        clarity_plan = self._build_clarity_plan(slider_estimates["clarity"].value)
         generated_parameters = {
-            "jibberish": self._derive_jibberish_parameters(controls),
+            "jibberish": self._derive_jibberish_parameters(slider_estimates["jibberish"].value, controls),
             "clarity": clarity_plan.parameters,
-            "timing_instability": self._derive_timing_parameters(controls),
+            "timing_instability": self._derive_timing_parameters(slider_estimates["timing_instability"].value),
         }
 
         repairs: List[RepairAction] = []
@@ -291,7 +360,11 @@ class HeuristicPronunciationPlanner:
             operations, repairs = self._repair_plan(skeletons, operations, controls)
             similarity = self._score_plan(skeletons, operations, controls)
 
-        operations.sort(key=lambda item: (item.target_phone_indices[0], item.edit_type.value) if item.target_phone_indices else (10**9, item.edit_type.value))
+        operations.sort(
+            key=lambda item: (item.target_phone_indices[0], item.edit_type.value)
+            if item.target_phone_indices
+            else (10**9, item.edit_type.value)
+        )
         return PronunciationSafePlan(
             controls=controls,
             skeletons=skeletons,
@@ -301,6 +374,22 @@ class HeuristicPronunciationPlanner:
             similarity=similarity,
             repairs=repairs,
             generated_parameters=generated_parameters,
+            slider_estimates=slider_estimates,
+            distance_evidence=distance_evidence,
+            evidence_bundle=evidence_bundle,
+            candidates=candidates,
+            selected_candidates=selected_candidates,
+            trace=self._build_trace(
+                skeletons=skeletons,
+                operations=operations,
+                selected_candidates=selected_candidates,
+                distance_evidence=distance_evidence,
+                slider_estimates=slider_estimates,
+                repairs=repairs,
+                similarity=similarity,
+                candidates=candidates,
+                evidence_bundle=evidence_bundle,
+            ),
         )
 
     def _build_skeletons(self, graph: PhoneGraph) -> List[PronunciationSkeleton]:
@@ -368,7 +457,7 @@ class HeuristicPronunciationPlanner:
         return skeletons
 
     def _build_protection_map(self, skeleton: PronunciationSkeleton) -> ProtectionMap:
-        jibberish_guardrails = self.config.sliders["jibberish"].pronunciation_guardrails.values
+        jibberish_guardrails = self.config.sliders["jibberish"].guardrails.values
         return ProtectionMap(
             protected_phone_indices=list(skeleton.anchor_phone_indices),
             anchor_phone_indices=list(skeleton.anchor_phone_indices),
@@ -377,141 +466,274 @@ class HeuristicPronunciationPlanner:
             preserve_syllable_count=bool(jibberish_guardrails.get("preserve_syllable_count", True)),
         )
 
-    def _plan_jibberish(
-        self, graph: PhoneGraph, skeletons: List[PronunciationSkeleton], controls: SliderControls
-    ) -> List[EditOperation]:
-        slider = self.config.sliders["jibberish"]
-        parameters = self._derive_jibberish_parameters(controls)
-        operations: List[EditOperation] = []
-        nodes_by_index = {node.index: node for node in graph.nodes}
+    def _build_candidate_scores(
+        self, skeleton: PronunciationSkeleton, jibberish_estimate: SliderEstimate, controls: SliderControls
+    ) -> List[CandidateScore]:
+        threshold = self._candidate_similarity_threshold(skeleton, controls)
+        max_safe_phoneme_distance = 0.55
+        if jibberish_estimate.value >= 0.85:
+            max_safe_phoneme_distance = 0.68
+        elif jibberish_estimate.value >= 0.65:
+            max_safe_phoneme_distance = 0.62
+        candidates: List[CandidateScore] = []
+        duration_shape_similarity = max(0.0, 1.0 - min(1.0, controls.distance_overrides.get("duration_shape_distance", 0.0)))
+        for variant in self._generate_grapheme_candidates(skeleton.word, jibberish_estimate.value):
+            phones = self.g2p.phonemize(variant.replace("-", " "))
+            phoneme_distance = self._phoneme_distance(skeleton.phone_sequence, phones, skeleton)
+            pronunciation_similarity = self._candidate_similarity(skeleton, phones, duration_shape_similarity)
+            accepted = pronunciation_similarity >= threshold and phoneme_distance <= max_safe_phoneme_distance
+            rejection_reason = ""
+            if not accepted:
+                rejection_reason = "below_similarity_threshold"
+                if phoneme_distance > max_safe_phoneme_distance:
+                    rejection_reason = "unsafe_phoneme_distance"
+            candidates.append(
+                CandidateScore(
+                    word=skeleton.word,
+                    word_index=skeleton.word_index,
+                    grapheme=variant,
+                    phones=phones,
+                    grapheme_distance=self._grapheme_distance(skeleton.word, variant),
+                    phoneme_distance=phoneme_distance,
+                    pronunciation_similarity=pronunciation_similarity,
+                    accepted=accepted,
+                    rejection_reason=rejection_reason,
+                )
+            )
+        candidates.sort(
+            key=lambda item: (
+                not item.accepted,
+                -(item.pronunciation_similarity),
+                item.phoneme_distance,
+                -item.grapheme_distance,
+                item.grapheme,
+            )
+        )
+        return candidates
 
-        for skeleton in skeletons:
-            word_guardrails = self._guardrails_for_skeleton(slider, skeleton)
-            candidate_indices = [
-                index
-                for index in skeleton.phone_indices
-                if index not in skeleton.anchor_phone_indices and index != skeleton.primary_vowel_index
+    def _select_candidate(
+        self,
+            skeleton: PronunciationSkeleton,
+            candidates: List[CandidateScore],
+            jibberish_estimate: SliderEstimate,
+    ) -> CandidateScore:
+        accepted = [candidate for candidate in candidates if candidate.accepted]
+        if not accepted:
+            return CandidateScore(
+                word=skeleton.word,
+                word_index=skeleton.word_index,
+                grapheme=skeleton.word,
+                phones=list(skeleton.phone_sequence),
+                pronunciation_similarity=1.0,
+                accepted=True,
+            )
+        if jibberish_estimate.value <= 0.2:
+            accepted.sort(
+                key=lambda item: (
+                    item.grapheme != skeleton.word,
+                    -item.pronunciation_similarity,
+                    item.phoneme_distance,
+                    item.grapheme_distance,
+                    item.grapheme,
+                )
+            )
+            return accepted[0]
+
+        if jibberish_estimate.value >= 0.75:
+            strongly_mutated = [
+                item
+                for item in accepted
+                if item.grapheme != skeleton.word
+                and (
+                    item.grapheme_distance >= 0.42
+                    or abs(len(item.grapheme) - len(skeleton.word)) >= 2
+                    or "-" in item.grapheme
+                )
             ]
-            substitution_budget = int(
-                min(
-                    len(candidate_indices),
-                    round(len(skeleton.phone_indices) * float(word_guardrails.get("max_phone_substitution_ratio", 0.0))),
+            if strongly_mutated:
+                accepted = strongly_mutated
+
+        target_grapheme_distance = min(0.92, 0.24 + (jibberish_estimate.value * 0.58))
+        target_visual_change = min(0.90, 0.20 + (jibberish_estimate.value * 0.65))
+        accepted.sort(
+            key=lambda item: (
+                -(
+                    (item.pronunciation_similarity * 0.34)
+                    + ((1.0 - item.phoneme_distance) * 0.24)
+                    + (
+                        max(
+                            0.0,
+                            1.0 - abs(item.grapheme_distance - target_grapheme_distance) / max(target_grapheme_distance, 0.15),
+                        )
+                        * 0.22
+                    )
+                    + (
+                        max(
+                            0.0,
+                            1.0 - abs(self._visual_change_score(skeleton.word, item.grapheme) - target_visual_change)
+                            / max(target_visual_change, 0.18),
+                        )
+                        * 0.16
+                    )
+                    + ((1.0 if item.grapheme != skeleton.word else 0.0) * 0.12 * jibberish_estimate.value)
+                ),
+                item.grapheme == skeleton.word and jibberish_estimate.value >= 0.45,
+                item.grapheme,
+            )
+        )
+        return accepted[0]
+
+    def _visual_change_score(self, original: str, candidate: str) -> float:
+        base = original.lower()
+        variant = candidate.lower()
+        score = self._grapheme_distance(base, variant) * 0.55
+        if variant != base:
+            score += 0.15
+        if "-" in variant:
+            score += 0.18
+        score += min(0.2, abs(len(variant) - len(base)) * 0.07)
+        if any(double in variant for double in ("aa", "ee", "ii", "oo", "uu")):
+            score += 0.08
+        if variant.endswith(("oh", "uh", "ah", "ayo", "owa", "iya")):
+            score += 0.10
+        return round(max(0.0, min(1.0, score)), 4)
+
+    def _build_operations_for_candidate(
+        self,
+        graph: PhoneGraph,
+        skeleton: PronunciationSkeleton,
+        candidate: CandidateScore,
+        controls: SliderControls,
+        jibberish_estimate: SliderEstimate,
+    ) -> List[EditOperation]:
+        nodes_by_index = {node.index: node for node in graph.nodes}
+        slider = self.config.sliders["jibberish"]
+        guardrails = self._guardrails_for_skeleton(slider, skeleton)
+        confidence_scale = max(0.4, jibberish_estimate.confidence)
+        candidate_indices = [
+            index
+            for index in skeleton.phone_indices
+            if index not in skeleton.anchor_phone_indices and index != skeleton.primary_vowel_index
+        ]
+        substitution_budget = int(
+            min(
+                len(candidate_indices),
+                round(
+                    len(skeleton.phone_indices)
+                    * float(guardrails.get("max_phone_substitution_ratio", 0.0))
+                    * confidence_scale
+                ),
+            )
+        )
+        operations: List[EditOperation] = []
+        differing_positions = [
+            position
+            for position in range(min(len(skeleton.phone_sequence), len(candidate.phones)))
+            if skeleton.phone_sequence[position] != candidate.phones[position]
+        ]
+        for position in differing_positions[:substitution_budget]:
+            target_index = skeleton.phone_indices[position]
+            if target_index in skeleton.anchor_phone_indices:
+                continue
+            node = nodes_by_index[target_index]
+            operations.append(
+                EditOperation(
+                    edit_type=EditType.SUBSTITUTE,
+                    target_phone_indices=[target_index],
+                    replacement_phones=[candidate.phones[position]],
+                    complexity_weight=round(jibberish_estimate.value, 4),
+                    notes=[
+                        "grapheme_guided_jibberish",
+                        "candidate={0}".format(candidate.grapheme),
+                        "distance={0}".format(int(round(1 + (candidate.phoneme_distance * 3)))),
+                        "source_phone={0}".format(node.phone),
+                    ],
                 )
             )
-            substitution_target = min(
-                substitution_budget,
-                int(round(len(candidate_indices) * parameters["substitution_probability"])),
+
+        if not operations and candidate.grapheme != skeleton.word and jibberish_estimate.value >= 0.65:
+            target_index = next(
+                (
+                    index
+                    for index in skeleton.phone_indices
+                    if index not in skeleton.anchor_phone_indices
+                ),
+                skeleton.phone_indices[0],
+            )
+            operations.append(
+                EditOperation(
+                    edit_type=EditType.DISTORT,
+                    target_phone_indices=[target_index],
+                    complexity_weight=round(jibberish_estimate.value, 4),
+                    notes=["surface_variant_only", "candidate={0}".format(candidate.grapheme)],
+                )
             )
 
-            for phone_index in candidate_indices[:substitution_target]:
-                node = nodes_by_index[phone_index]
-                replacement = self._replacement_phone(node, int(parameters["substitution_distance"]))
-                operations.append(
-                    EditOperation(
-                        edit_type=EditType.SUBSTITUTE,
-                        target_phone_indices=[phone_index],
-                        replacement_phones=[replacement],
-                        complexity_weight=round(controls.jibberish, 4),
-                        notes=["pronunciation_safe_jibberish", "distance={0}".format(int(parameters["substitution_distance"]))],
-                    )
+        if not controls.allow_full_gibberish and jibberish_estimate.value >= 0.7 and skeleton.is_short_word:
+            operations.append(
+                EditOperation(
+                    edit_type=EditType.DISTORT,
+                    target_phone_indices=[skeleton.phone_indices[0]],
+                    complexity_weight=round(jibberish_estimate.value, 4),
+                    notes=["short_word_core_preserved"],
                 )
-
-            if controls.allow_full_gibberish and parameters["deletion_probability"] > 0.0 and candidate_indices:
-                operations.append(
-                    EditOperation(
-                        edit_type=EditType.SUBSTITUTE,
-                        target_phone_indices=[candidate_indices[-1]],
-                        replacement_phones=["AH"],
-                        complexity_weight=round(controls.jibberish, 4),
-                        notes=["full_gibberish_override"],
-                    )
-                )
-
-            if not controls.allow_full_gibberish and controls.jibberish > 0.65 and skeleton.is_short_word:
-                first_index = skeleton.phone_indices[0]
-                operations.append(
-                    EditOperation(
-                        edit_type=EditType.DISTORT,
-                        target_phone_indices=[first_index],
-                        complexity_weight=round(controls.jibberish, 4),
-                        notes=["short_word_anchor_preserved", "surface_distortion_only"],
-                    )
-                )
-
+            )
         return operations
 
     def _guardrails_for_skeleton(self, slider: object, skeleton: PronunciationSkeleton) -> Dict[str, object]:
-        assert hasattr(slider, "pronunciation_guardrails")
-        base = dict(slider.pronunciation_guardrails.values)
-        short_word_mode = slider.pronunciation_guardrails.short_word_mode
+        assert hasattr(slider, "guardrails")
+        base = dict(slider.guardrails.values)
+        short_word_mode = slider.guardrails.short_word_mode
         if skeleton.is_short_word and short_word_mode is not None:
             base["max_phone_substitution_ratio"] = short_word_mode.max_phone_substitution_ratio
             base["max_deletions_per_word"] = short_word_mode.max_deletions_per_word
             base["preserve_first_phone"] = short_word_mode.preserve_first_phone
             base["preserve_primary_vowel_nucleus"] = short_word_mode.preserve_primary_vowel_nucleus
+            if short_word_mode.minimum_pronunciation_similarity is not None:
+                base["minimum_pronunciation_similarity"] = short_word_mode.minimum_pronunciation_similarity
         return base
-
-    def _replacement_phone(self, node: PhoneNode, distance: int) -> str:
-        manner = node.features.manner
-        if self._is_vowel(node.phone):
-            ladder = ["AH", "EH", "IH", "OW", "ER", "AE"]
-        elif manner == "nasal":
-            ladder = ["N", "M", "NG"]
-        elif manner == "stop":
-            ladder = ["T", "D", "K", "P"]
-        elif manner == "fricative":
-            ladder = ["S", "SH", "Z", "TH"]
-        elif manner == "liquid":
-            ladder = ["R", "L", "W"]
-        else:
-            ladder = [node.phone]
-        if node.phone in ladder:
-            start = ladder.index(node.phone)
-        else:
-            start = 0
-        return ladder[min(start + max(distance - 1, 0), len(ladder) - 1)]
 
     def _is_vowel(self, phone: str) -> bool:
         return phone in {"AE", "AH", "EH", "IH", "IY", "OW", "UW", "AY", "EY", "OY", "AW", "ER", "AA"}
 
-    def _derive_jibberish_parameters(self, controls: SliderControls) -> Dict[str, float]:
-        guardrails = self.config.sliders["jibberish"].pronunciation_guardrails.values
+    def _derive_jibberish_parameters(self, jibberish_value: float, controls: SliderControls) -> Dict[str, float]:
+        guardrails = self.config.sliders["jibberish"].guardrails.values
         return {
-            "substitution_probability": round(pow(controls.jibberish, 1.2) * 0.60, 4),
-            "substitution_distance": float(round(1 + (controls.jibberish * 3))),
-            "vowel_shift_probability": round(max(min((controls.jibberish - 0.15) / 0.85, 1.0), 0.0) * 0.50, 4),
-            "insertion_probability": round(max(min((controls.jibberish - 0.45) / 0.55, 1.0), 0.0) * 0.30, 4),
-            "deletion_probability": 0.0 if not controls.allow_full_gibberish else round(controls.jibberish * 0.15, 4),
-            "repetition_probability": round(max(min((controls.jibberish - 0.60) / 0.40, 1.0), 0.0) * 0.25, 4),
+            "substitution_probability": round(pow(jibberish_value, 1.2) * 0.60, 4),
+            "substitution_distance": float(round(1 + (jibberish_value * 3))),
+            "vowel_shift_probability": round(max(min((jibberish_value - 0.15) / 0.85, 1.0), 0.0) * 0.50, 4),
+            "insertion_probability": round(max(min((jibberish_value - 0.45) / 0.55, 1.0), 0.0) * 0.30, 4),
+            "deletion_probability": 0.0 if not controls.allow_full_gibberish else round(jibberish_value * 0.15, 4),
+            "repetition_probability": round(max(min((jibberish_value - 0.60) / 0.40, 1.0), 0.0) * 0.25, 4),
             "max_anchor_phone_distance": float(guardrails.get("max_anchor_phone_distance", 1)),
         }
 
-    def _derive_timing_parameters(self, controls: SliderControls) -> Dict[str, float]:
-        guardrails = self.config.sliders["timing_instability"].pronunciation_guardrails.values
+    def _derive_timing_parameters(self, timing_value: float) -> Dict[str, float]:
+        guardrails = self.config.sliders["timing_instability"].guardrails.values
         max_pause = float(guardrails.get("max_pause_ms_inside_short_word", 180))
         return {
-            "phone_duration_jitter": round(controls.timing_instability * 0.35, 4),
-            "syllable_duration_jitter": round(controls.timing_instability * 0.25, 4),
-            "pause_insertion_probability": round(max(min((controls.timing_instability - 0.30) / 0.70, 1.0), 0.0) * 0.35, 4),
-            "pause_duration_ms": round(min(20 + (controls.timing_instability * 180), max_pause), 4),
-            "micro_stutter_probability": round(max(min((controls.timing_instability - 0.45) / 0.55, 1.0), 0.0) * 0.45, 4),
-            "onset_repeat_probability": round(max(min((controls.timing_instability - 0.55) / 0.45, 1.0), 0.0) * 0.35, 4),
+            "phone_duration_jitter": round(timing_value * 0.35, 4),
+            "syllable_duration_jitter": round(timing_value * 0.25, 4),
+            "pause_insertion_probability": round(max(min((timing_value - 0.30) / 0.70, 1.0), 0.0) * 0.35, 4),
+            "pause_duration_ms": round(min(20 + (timing_value * 180), max_pause), 4),
+            "micro_stutter_probability": round(max(min((timing_value - 0.45) / 0.55, 1.0), 0.0) * 0.45, 4),
+            "onset_repeat_probability": round(max(min((timing_value - 0.55) / 0.45, 1.0), 0.0) * 0.35, 4),
         }
 
-    def _build_clarity_plan(self, controls: SliderControls) -> ClarityPlan:
-        guardrails = dict(self.config.sliders["clarity"].pronunciation_guardrails.values)
+    def _build_clarity_plan(self, clarity_value: float) -> ClarityPlan:
+        guardrails = dict(self.config.sliders["clarity"].guardrails.values)
         max_formant = float(guardrails.get("max_formant_centralization_for_anchor_vowels", 0.45))
         min_burst = float(guardrails.get("min_consonant_burst_energy_ratio", 0.35))
         max_blur_ms = float(guardrails.get("max_transition_blur_ms", 60))
         return ClarityPlan(
             parameters={
-                "formant_centralization": round(min(controls.clarity * 0.70, max_formant), 4),
-                "spectral_tilt_db_per_octave": round(controls.clarity * -5.0, 4),
-                "high_frequency_reduction": round(controls.clarity * 0.80, 4),
-                "consonant_burst_softening": round(min(pow(controls.clarity, 1.1) * 0.90, 1 - min_burst), 4),
-                "fricative_smearing": round(controls.clarity * 0.85, 4),
-                "transition_blur_ms": round(min(5 + (controls.clarity * 55), max_blur_ms), 4),
-                "breath_noise_mix": round(controls.clarity * 0.12, 4),
+                "formant_centralization": round(min(clarity_value * 0.70, max_formant), 4),
+                "spectral_tilt_db_per_octave": round(clarity_value * -5.0, 4),
+                "high_frequency_reduction": round(clarity_value * 0.80, 4),
+                "consonant_burst_softening": round(min(pow(clarity_value, 1.1) * 0.90, 1 - min_burst), 4),
+                "fricative_smearing": round(clarity_value * 0.85, 4),
+                "transition_blur_ms": round(min(5 + (clarity_value * 55), max_blur_ms), 4),
+                "breath_noise_mix": round(clarity_value * 0.12, 4),
             },
             guardrails=guardrails,
         )
@@ -574,9 +796,9 @@ class HeuristicPronunciationPlanner:
 
         short_word_present = any(skeleton.is_short_word for skeleton in skeletons)
         threshold = (
-            self.config.global_constraints.minimum_pronunciation_similarity_short_word
+            self.config.pronunciation_similarity_score.short_word_threshold
             if short_word_present
-            else self.config.global_constraints.minimum_pronunciation_similarity
+            else self.config.pronunciation_similarity_score.default_threshold
         )
         if controls.allow_full_gibberish:
             override_mode = self.config.override_modes.get("full_gibberish")
@@ -659,3 +881,172 @@ class HeuristicPronunciationPlanner:
                 break
 
         return repaired, repairs
+
+    def _candidate_similarity_threshold(
+        self, skeleton: PronunciationSkeleton, controls: SliderControls
+    ) -> float:
+        threshold = (
+            self.config.pronunciation_similarity_score.short_word_threshold
+            if skeleton.is_short_word
+            else self.config.pronunciation_similarity_score.default_threshold
+        )
+        if controls.allow_full_gibberish:
+            override_mode = self.config.override_modes.get("full_gibberish")
+            if override_mode is not None:
+                threshold = float(override_mode.values.get("minimum_pronunciation_similarity", threshold))
+        guardrails = self._guardrails_for_skeleton(self.config.sliders["jibberish"], skeleton)
+        return float(guardrails.get("minimum_pronunciation_similarity", threshold))
+
+    def _candidate_similarity(
+        self,
+        skeleton: PronunciationSkeleton,
+        phones: List[str],
+        duration_shape_similarity: float,
+    ) -> float:
+        return self._evidence_computer.pronunciation_similarity(
+            skeleton=skeleton,
+            candidate_phones=phones,
+            duration_shape_similarity=duration_shape_similarity,
+        )
+
+    def _phoneme_distance(
+        self, original_phones: List[str], candidate_phones: List[str], skeleton: PronunciationSkeleton
+    ) -> float:
+        mismatches = abs(len(original_phones) - len(candidate_phones))
+        for index in range(min(len(original_phones), len(candidate_phones))):
+            if original_phones[index] != candidate_phones[index]:
+                mismatches += self._evidence_computer.feature_aware_phone_distance(
+                    original_phones[index],
+                    candidate_phones[index],
+                )
+                phone_index = skeleton.phone_indices[index]
+                if phone_index in skeleton.anchor_phone_indices:
+                    mismatches += 0.75
+                if phone_index == skeleton.primary_vowel_index:
+                    mismatches += 0.75
+        return round(min(1.0, mismatches / float(max(len(original_phones), 1) * 2.25)), 4)
+
+    def _grapheme_distance(self, original: str, candidate: str) -> float:
+        return self._evidence_computer.weighted_grapheme_distance(original, candidate)
+
+    def _generate_grapheme_candidates(self, word: str, jibberish_value: float) -> List[str]:
+        base = word.lower()
+        candidates = {base}
+        operations = list(
+            self.config.sliders["jibberish"].generated_parameters.get("operations", [])
+            if isinstance(self.config.sliders["jibberish"].generated_parameters.get("operations"), list)
+            else []
+        )
+        max_candidates = max(MAX_CANDIDATES_0, int(round(10 + (jibberish_value * 28))))
+        vowel_families = {
+            "a": ["ah", "aw", "aa"],
+            "e": ["eh", "ee", "ae"],
+            "i": ["ih", "ee", "iy"],
+            "o": ["oh", "oo", "aw", "oa"],
+            "u": ["uh", "oo", "yu"],
+        }
+        if not base:
+            return [base]
+        if not operations or "letter_repetition" in operations or jibberish_value >= 0.05:
+            candidates.add(base + base[-1])
+            if len(base) > 1:
+                candidates.add(base[:-1] + (base[-1] * 2))
+        if not operations or "weak_schwa_like_suffix" in operations or jibberish_value >= 0.15:
+            candidates.add(base + "h")
+            candidates.add(base + "uh")
+        if not operations or "vowel_variant_spelling" in operations or jibberish_value >= 0.25:
+            for vowel, variants in vowel_families.items():
+                if vowel in base:
+                    for variant in variants:
+                        candidates.add(base.replace(vowel, variant, 1))
+                        if jibberish_value >= 0.55:
+                            candidates.add(base.replace(vowel, variant, 2))
+        if (not operations or "onset_preserving_mutation" in operations or "soft_consonant_insertion" in operations) and jibberish_value >= 0.35 and len(base) > 1:
+            candidates.add(base[0] + "y" + base[1:])
+            candidates.add(base[0] + "w" + base[1:])
+            candidates.add(base[0] + "l" + base[1:])
+            candidates.add(base[0] + "r" + base[1:])
+        if (not operations or "pseudo_syllable_expansion" in operations) and jibberish_value >= 0.5:
+            candidates.add(base + "-oh")
+            candidates.add(base + "-uh")
+            candidates.add(base + "-ah")
+            if len(base) > 2:
+                candidates.add(base + "-ee")
+        if (not operations or "rime_preserving_mutation" in operations) and jibberish_value >= 0.65 and len(base) > 2:
+            candidates.add(base[0] + base[1] + base[1:] + "oh")
+            candidates.add(base[:-1] + base[-1] + "ah")
+            candidates.add(base[:-1] + "eh" + base[-1])
+        if jibberish_value >= 0.75:
+            candidates.add(base + base[-1] + "a")
+            candidates.add(base + "ya")
+            candidates.add(base + "wa")
+            if len(base) > 1:
+                candidates.add(base[0] + "a" + base[1:] + "uh")
+        if jibberish_value >= 0.85:
+            candidates.add(base + "-ayo")
+            candidates.add(base + "-owa")
+            if len(base) > 2:
+                candidates.add(base[:-1] + base[-1] + base[-1] + "oh")
+                candidates.add(base[0] + "uh" + base[1:] + "a")
+        if jibberish_value >= 0.95 and len(base) > 1:
+            candidates.add(base[0] + "a" + base[1:] + "-uh")
+            candidates.add(base + "-iya")
+
+        ordered = sorted(candidates, key=lambda item: (self._grapheme_distance(base, item), item))
+        return ordered[:max_candidates]
+
+    def _build_trace(
+        self,
+        skeletons: List[PronunciationSkeleton],
+        operations: List[EditOperation],
+        selected_candidates: List[CandidateScore],
+        distance_evidence: Dict[str, DistanceSignal],
+        slider_estimates: Dict[str, SliderEstimate],
+        repairs: List[RepairAction],
+        similarity: PronunciationSimilarityScore,
+        candidates: List[CandidateScore],
+        evidence_bundle: DistanceEvidenceBundle,
+    ) -> DecisionTrace:
+        primary_skeleton = skeletons[0]
+        primary_candidate = selected_candidates[0] if selected_candidates else CandidateScore(
+            word=primary_skeleton.word,
+            word_index=primary_skeleton.word_index,
+            grapheme=primary_skeleton.word,
+            phones=list(primary_skeleton.phone_sequence),
+            pronunciation_similarity=1.0,
+            accepted=True,
+        )
+        return DecisionTrace(
+            target_word=primary_skeleton.word,
+            target_graphemes=primary_skeleton.word,
+            target_phones=list(primary_skeleton.phone_sequence),
+            selected_grapheme_variant=primary_candidate.grapheme,
+            selected_phones=list(primary_candidate.phones),
+            pronunciation_similarity=similarity.score,
+            slider_values={name: estimate.value for name, estimate in slider_estimates.items()},
+            confidence={name: estimate.confidence for name, estimate in slider_estimates.items()},
+            distance_evidence={name: signal.value for name, signal in distance_evidence.items()},
+            distance_features={name: dict(signal.raw_features) for name, signal in distance_evidence.items()},
+            routing_rules={
+                name: decision.routing_rule or ""
+                for name, decision in evidence_bundle.routing.items()
+            },
+            acoustic_backend=str(
+                distance_evidence.get("acoustic_embedding_distance", DistanceSignal(name="acoustic_embedding_distance", value=0.0)).raw_features.get("acoustic_backend", "proxy")
+            ),
+            acoustic_model_path=str(
+                distance_evidence.get("acoustic_embedding_distance", DistanceSignal(name="acoustic_embedding_distance", value=0.0)).raw_features.get("acoustic_model_path", "")
+            ),
+            acoustic_model_loaded=bool(
+                distance_evidence.get("acoustic_embedding_distance", DistanceSignal(name="acoustic_embedding_distance", value=0.0)).raw_features.get("acoustic_model_loaded", False)
+            ),
+            acoustic_model_compatibility=str(
+                distance_evidence.get("acoustic_embedding_distance", DistanceSignal(name="acoustic_embedding_distance", value=0.0)).raw_features.get("acoustic_model_compatibility", "unavailable")
+            ),
+            edits=[
+                "{0}:{1}".format(operation.edit_type.value, ",".join(str(index) for index in operation.target_phone_indices))
+                for operation in operations
+            ],
+            rejected_candidates=[candidate.grapheme for candidate in candidates if not candidate.accepted],
+            repair_actions=[repair.name for repair in repairs if repair.applied],
+        )

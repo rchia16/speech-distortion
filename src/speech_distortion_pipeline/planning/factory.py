@@ -1,9 +1,10 @@
 from __future__ import annotations
 
-from speech_distortion_pipeline.config import PronunciationSliderConfig
+from speech_distortion_pipeline.config import HybridConfig
+from speech_distortion_pipeline.phonology import GraphemeToPhoneme
 from speech_distortion_pipeline.models import SeverityProfile
 
-from .planner import ErrorPlanner, HeuristicErrorPlanner, HeuristicPronunciationPlanner, PronunciationPlanner
+from .planner import ErrorPlanner, HeuristicErrorPlanner, HeuristicHybridPlanner, HybridPlanner
 
 
 def build_severity_profile(
@@ -42,5 +43,5 @@ def build_error_planner() -> ErrorPlanner:
     return HeuristicErrorPlanner()
 
 
-def build_pronunciation_planner(config: PronunciationSliderConfig) -> PronunciationPlanner:
-    return HeuristicPronunciationPlanner(config=config)
+def build_hybrid_planner(config: HybridConfig, g2p: GraphemeToPhoneme) -> HybridPlanner:
+    return HeuristicHybridPlanner(config=config, g2p=g2p)

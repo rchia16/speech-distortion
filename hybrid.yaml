@@ -1,0 +1,507 @@
+version: 4
+kind: speech_distortion_agent
+name: hybrid_grapheme_guided_phoneme_safe_distance_aware_speech_distortion
+description: Hybrid speech distortion with grapheme-guided jibberish, phoneme validation, acoustic clarity, temporal
+  timing instability, and distance/embedding evidence routing.
+global_constraints:
+  slider_range:
+    min: 0.0
+    max: 1.0
+  time_range:
+    min: 0.0
+    max: 1.0
+    meaning: normalized_template_or_utterance_position
+  preserve_core_pronunciation: true
+  allow_full_gibberish: false
+  minimum_pronunciation_similarity: 0.72
+  minimum_pronunciation_similarity_short_word: 0.82
+  max_total_duration_drift_ratio: 0.12
+  emit_trace_default: true
+  random_seed: 7
+control_model:
+  jibberish:
+    control_space: grapheme_guided
+    validation_space: phoneme
+    distance_space:
+    - grapheme_distance
+    - phoneme_distance
+    - pronunciation_similarity
+    render_space: acoustic
+  clarity:
+    control_space: perceptual
+    validation_space: phoneme_anchor_preservation
+    distance_space:
+    - acoustic_embedding_distance
+    - spectral_feature_distance
+    - formant_trajectory_distance
+    render_space: acoustic
+  timing_instability:
+    control_space: perceptual
+    validation_space: phone_order_and_syllable_shape
+    distance_space:
+    - temporal_distance
+    - dtw_warp_distance
+    - duration_shape_distance
+    render_space: temporal_audio
+distance_and_embedding_model:
+  enabled: true
+  purpose:
+  - rank_grapheme_candidates
+  - validate_pronunciation_similarity
+  - estimate_acoustic_clarity_degradation
+  - estimate_timing_instability
+  - map_template_mismatch_to_slider_envelopes
+  normalization:
+    output_range:
+    - 0.0
+    - 1.0
+    higher_means_more_different: true
+    smoothing:
+      enabled: true
+      default_method: median_then_gaussian
+      default_window_ms: 80
+  grapheme_distance:
+    type: weighted_levenshtein
+    role:
+    - rank_grapheme_candidates
+    - discourage_unreadable_spelling_drift
+    features:
+    - insertion
+    - deletion
+    - substitution
+    - repeated_letter
+    - vowel_variant
+    - onset_preservation
+    - rime_preservation
+    default_weighting:
+      preserve_first_letter: high
+      preserve_vowel_letter_family: medium
+      repeated_letters: low_penalty
+      unrelated_onset_change: high_penalty
+  phoneme_distance:
+    type: articulatory_feature_distance
+    role:
+    - pronunciation_safety
+    - candidate_selection
+    - word_core_preservation
+    features:
+    - place
+    - manner
+    - voicing
+    - vowel_height
+    - vowel_backness
+    - vowel_rounding
+    - stress
+    - syllable_position
+    default_weighting:
+      anchor_phone_change: high
+      primary_vowel_change: high
+      manner_change: medium_high
+      place_change: medium
+      voicing_change: low_medium
+  pronunciation_similarity:
+    type: weighted_composite_score
+    range:
+    - 0.0
+    - 1.0
+    higher_means_more_similar: true
+    default_threshold: 0.72
+    short_word_threshold: 0.82
+    weights:
+      anchor_phone_preservation: 0.35
+      vowel_nucleus_similarity: 0.25
+      syllable_count_similarity: 0.15
+      phone_order_similarity: 0.15
+      duration_shape_similarity: 0.1
+  acoustic_embedding_distance:
+    type: configurable
+    preferred:
+    - wav2vec_or_hubert_embedding_cosine
+    - mfcc_dtw_distance
+    - formant_trajectory_distance
+    fallback:
+    - mfcc_cosine_distance
+    - spectral_centroid_distance
+    - f0_contour_distance
+    - jitter_shimmer_hnr_features
+    role:
+    - clarity_estimation
+    - acoustic_residual_scoring
+    - audio_similarity_validation
+  temporal_distance:
+    type: dtw_warp_distance
+    role:
+    - timing_instability_estimation
+    - duration_shape_validation
+    features:
+    - local_dtw_slope
+    - warp_ratio
+    - pause_mismatch
+    - phone_duration_ratio
+    - syllable_duration_ratio
+    - repeated_or_held_regions
+  neural_embedding_distance:
+    type: optional
+    preferred:
+    - wasserstein_distribution_distance
+    - cosine_distance_between_eeg_embeddings
+    - mahalanobis_distance_between_template_features
+    role:
+    - eeg_template_mismatch
+    - cross_subject_or_cross_session_calibration
+    - confidence_adjustment
+    - optional_slider_prior
+pronunciation_skeleton:
+  required: true
+  fields:
+  - target_word
+  - canonical_graphemes
+  - canonical_phones
+  - pronunciation_candidates
+  - anchor_phones
+  - primary_vowel_nucleus
+  - stress_bearing_phones
+  - syllable_count
+  - onset_rime_shape
+  - word_boundary_shape
+  - manner_classes
+  - protected_features
+  anchor_selection_rules:
+    always_anchor_primary_vowel: true
+    always_anchor_first_content_consonant: true
+    anchor_final_consonant_for_closed_syllables: true
+    short_word_anchor_all_phones_when_phone_count_lte: 3
+  example:
+    target_word: 'no'
+    canonical_graphemes: 'no'
+    canonical_phones:
+    - N
+    - OW
+    anchor_phones:
+    - N
+    - OW
+    primary_vowel_nucleus: OW
+    syllable_count: 1
+    onset_rime_shape: CV
+    word_boundary_shape:
+      starts_with: consonant
+      ends_with: vowel
+    protected_features:
+    - nasal_onset
+    - rounded_vowel_nucleus
+    - single_syllable_shape
+pronunciation_similarity_score:
+  range:
+  - 0.0
+  - 1.0
+  default_threshold: 0.72
+  short_word_threshold: 0.82
+  weights:
+    anchor_phone_preservation: 0.35
+    vowel_nucleus_similarity: 0.25
+    syllable_count_similarity: 0.15
+    phone_order_similarity: 0.15
+    duration_shape_similarity: 0.1
+  repair_order:
+  - restore_anchor_phones
+  - reduce_phoneme_substitution_distance
+  - remove_deletions
+  - limit_insertions
+  - reduce_repetitions
+  - reduce_timing_fragmentation
+  - rescore
+sliders:
+  jibberish:
+    default: 0.0
+    independence_rule: Must not automatically reduce clarity or add timing instability.
+    distance_inputs:
+      primary:
+      - phoneme_distance
+      - pronunciation_similarity
+      secondary:
+      - grapheme_distance
+      optional:
+      - word_or_syllable_embedding_distance
+      exclude:
+      - pure_acoustic_noise_distance
+      - pure_timing_distance
+    candidate_selection:
+      rank_by:
+      - pronunciation_similarity
+      - phoneme_distance
+      - grapheme_distance
+      reject_if:
+        pronunciation_similarity_below_threshold: true
+      prefer:
+      - onset_preserving_candidates
+      - vowel_nucleus_preserving_candidates
+      - syllable_count_preserving_candidates
+    grapheme_candidate_generation:
+      enabled: true
+      operations:
+      - letter_repetition
+      - vowel_variant_spelling
+      - soft_consonant_insertion
+      - weak_schwa_like_suffix
+      - onset_preserving_mutation
+      - rime_preserving_mutation
+      - pseudo_syllable_expansion
+      candidate_count_mapping: ceil(4 + jibberish * 16)
+      requires_g2p_after_generation: true
+    generated_parameters:
+      grapheme_variant_probability: jibberish
+      repeated_letter_probability: jibberish * 0.30
+      vowel_spelling_variant_probability: clamp((jibberish - 0.15) / 0.85, 0, 1) * 0.70
+      soft_onset_mutation_probability: clamp((jibberish - 0.35) / 0.65, 0, 1) * 0.35
+      weak_syllable_insertion_probability: clamp((jibberish - 0.50) / 0.50, 0, 1) * 0.35
+      phoneme_substitution_probability: pow(jibberish, 1.2) * 0.60
+      phoneme_substitution_distance: round(1 + jibberish * 3)
+      deletion_probability: 0.0 unless allow_full_gibberish is true
+    guardrails:
+      preserve_anchor_phones: true
+      preserve_primary_vowel_nucleus: true
+      preserve_syllable_count: true
+      preserve_phone_order: true
+      max_phone_substitution_ratio: 0.4
+      max_insertions_per_syllable: 1
+      max_deletions_per_word: 0
+      max_anchor_phone_distance: 1
+      max_non_anchor_phone_distance: 3
+      reject_candidates_below_similarity_threshold: true
+      short_word_mode:
+        enabled_when_phone_count_lte: 3
+        max_phone_substitution_ratio: 0.25
+        max_deletions_per_word: 0
+        preserve_first_phone: true
+        preserve_primary_vowel_nucleus: true
+        minimum_pronunciation_similarity: 0.82
+    example_candidates:
+      'no':
+        allowed:
+        - 'no'
+        - noh
+        - noo
+        - nuh
+        - naw
+        - nyoh
+        - nwoh
+        - nuh-oh
+        - nyuh-oh
+        disallowed:
+        - ka
+        - sho
+        - boo-tah
+        - meh-see
+  clarity:
+    default: 0.0
+    independence_rule: Must not substitute, insert, delete, or reorder phonemes.
+    distance_inputs:
+      primary:
+      - acoustic_embedding_distance
+      - spectral_feature_distance
+      secondary:
+      - formant_trajectory_distance
+      - fricative_band_energy_distance
+      - consonant_burst_energy_distance
+      optional: []
+      exclude:
+      - grapheme_distance
+      - phoneme_identity_distance
+    estimation_rule:
+      clarity_should_increase_when:
+      - acoustic_distance_high
+      - phoneme_identity_stable
+      - timing_distance_low_or_moderate
+    generated_parameters:
+      formant_centralization: min(clarity * 0.70, max_formant_centralization_for_anchor_vowels)
+      spectral_tilt_db_per_octave: clarity * -5.0
+      high_frequency_reduction: clarity * 0.80
+      consonant_burst_softening: min(pow(clarity, 1.1) * 0.90, 1 - min_consonant_burst_energy_ratio)
+      fricative_smearing: clarity * 0.85
+      transition_blur_ms: min(5 + clarity * 55, max_transition_blur_ms)
+      nasal_leakage: clamp((clarity - 0.25) / 0.75, 0, 1) * 0.45
+      breath_noise_mix: clarity * 0.12
+    guardrails:
+      preserve_anchor_phones: true
+      preserve_primary_vowel_nucleus: true
+      preserve_syllable_count: true
+      max_formant_centralization_for_anchor_vowels: 0.45
+      min_consonant_burst_energy_ratio: 0.35
+      min_vowel_duration_ratio: 0.7
+      max_transition_blur_ms: 60
+      preserve_anchor_phone_audibility: true
+  timing_instability:
+    default: 0.0
+    independence_rule: Must not automatically change phoneme identity or acoustic clarity.
+    distance_inputs:
+      primary:
+      - temporal_distance
+      - dtw_warp_distance
+      secondary:
+      - duration_shape_distance
+      - pause_pattern_distance
+      optional: []
+      exclude:
+      - grapheme_distance
+      - phoneme_substitution_distance
+    estimation_rule:
+      timing_instability_should_increase_when:
+      - local_dtw_slope_deviates
+      - phone_duration_ratio_extreme
+      - pause_or_hold_detected
+      - repeated_fragment_detected
+    generated_parameters:
+      phone_duration_jitter: timing_instability * 0.35
+      syllable_duration_jitter: timing_instability * 0.25
+      pause_insertion_probability: clamp((timing_instability - 0.30) / 0.70, 0, 1) * 0.35
+      pause_duration_ms: min(20 + timing_instability * 180, max_pause_ms_inside_short_word_for_short_words)
+      micro_stutter_probability: clamp((timing_instability - 0.45) / 0.55, 0, 1) * 0.45
+      onset_repeat_probability: clamp((timing_instability - 0.55) / 0.45, 0, 1) * 0.35
+      fragment_repetition_count: round(clamp((timing_instability - 0.65) / 0.35, 0, 1) * 2)
+      fragment_reversal_probability: 0.0 unless experimental_mode is true
+      duration_budget_strength: 1.0 - timing_instability * 0.35
+    guardrails:
+      preserve_phone_order: true
+      preserve_anchor_phones: true
+      max_phone_duration_scale: 1.8
+      min_phone_duration_scale: 0.55
+      max_onset_repeats: 2
+      max_pause_ms_inside_short_word: 180
+      max_total_duration_drift_ratio: 0.12
+      max_fragment_repetition_count: 2
+mismatch_decomposition:
+  enabled: true
+  coordinate_system: template_time
+  inputs:
+  - grapheme_distance
+  - phoneme_distance
+  - pronunciation_similarity
+  - acoustic_embedding_distance
+  - temporal_distance
+  - neural_embedding_distance
+  routing_rules:
+  - name: linguistic_mismatch
+    evidence:
+    - high_phoneme_distance
+    - low_pronunciation_similarity
+    - sustained_phone_level_residual
+    output_slider: jibberish
+  - name: acoustic_mismatch
+    evidence:
+    - high_acoustic_embedding_distance
+    - high_spectral_feature_distance
+    - stable_phone_identity
+    output_slider: clarity
+  - name: temporal_mismatch
+    evidence:
+    - high_temporal_distance
+    - abnormal_dtw_warp_ratio
+    - pause_or_hold_mismatch
+    output_slider: timing_instability
+  - name: neural_template_mismatch
+    evidence:
+    - high_neural_embedding_distance
+    - high_wasserstein_distribution_distance
+    output:
+    - local_confidence_adjustment
+    - optional_slider_prior
+  safety_rule:
+    high_neural_or_dtw_distance_alone_must_not_trigger_full_gibberish: true
+slider_envelope_estimation:
+  output_fields:
+  - value
+  - confidence
+  - evidence_sources
+  confidence_rules:
+    high_confidence:
+      requires:
+      - at_least_two_distance_sources_agree
+    low_confidence:
+      actions:
+      - reduce_slider_magnitude
+      - preserve_pronunciation_more_strictly
+      - avoid_full_gibberish
+      - prefer_conservative_candidate_selection
+processing_pipeline:
+- load_target_word
+- generate_pronunciation_candidates
+- extract_pronunciation_skeleton
+- parse_slider_envelopes
+- optional_dtw_align_query_to_template
+- compute_distance_and_embedding_signals
+- route_distance_evidence_to_slider_envelopes
+- generate_grapheme_jibberish_candidates
+- convert_grapheme_candidates_to_phonemes
+- score_and_select_pronunciation_safe_candidate
+- plan_timing
+- score_pronunciation_similarity
+- repair_unsafe_edits
+- render_or_splice_audio
+- apply_clarity
+- smooth_normalize_export
+trace_schema:
+  enabled: true
+  fields:
+  - target_word
+  - target_graphemes
+  - target_phones
+  - selected_grapheme_variant
+  - selected_phones
+  - pronunciation_similarity
+  - slider_values
+  - confidence
+  - distance_evidence
+  - edits
+  - rejected_candidates
+  - repair_actions
+override_modes:
+  full_gibberish:
+    allow_full_gibberish: true
+    minimum_pronunciation_similarity: 0.25
+    preserve_anchor_phones: false
+    preserve_syllable_count: false
+  experimental_reversal:
+    experimental_mode: true
+    fragment_reversal_probability: clamp((timing_instability - 0.75) / 0.25, 0, 1) * 0.20
+acceptance_tests:
+- name: grapheme_guided_jibberish_preserves_no_core
+  word: 'no'
+  controls:
+    jibberish: 1.0
+    clarity: 0.0
+    timing_instability: 0.0
+    allow_full_gibberish: false
+  expected: strange_variant_of_no_not_unrelated_word
+- name: clarity_does_not_alter_stop_phone_sequence
+  word: stop
+  phones:
+  - S
+  - T
+  - AA
+  - P
+  controls:
+    jibberish: 0.0
+    clarity: 1.0
+    timing_instability: 0.0
+  expected: slurred_stop_with_s_t_aa_p_structure
+- name: timing_preserves_yes_order
+  word: 'yes'
+  phones:
+  - Y
+  - EH
+  - S
+  controls:
+    jibberish: 0.0
+    clarity: 0.0
+    timing_instability: 1.0
+  expected: stuttered_or_stretched_yes_preserving_y_eh_s_order
+- name: dangerous_grapheme_candidate_rejected
+  word: bath
+  candidate_grapheme: bathe
+  expected: reject_or_downrank_if_pronunciation_similarity_below_threshold
+- name: distance_routing_independent
+  evidence:
+    high_temporal_distance: true
+    low_phoneme_distance: true
+    low_acoustic_distance: true
+  expected: increase_timing_instability_not_jibberish_or_clarity
