@@ -1058,6 +1058,74 @@ def build_root_asset_index(generated: Sequence[dict[str, Any]]) -> list[dict[str
     return rows
 
 
+def load_existing_json_array(path: Path) -> list[dict[str, Any]]:
+    if not path.is_file():
+        return []
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(payload, list):
+        raise ValueError(f"Expected top-level JSON array in '{path}'.")
+    return [dict(item) for item in payload if isinstance(item, dict)]
+
+
+def asset_index_identity(row: dict[str, Any]) -> tuple[str, str]:
+    preferred_path = (
+        row.get("sidecar_path")
+        or row.get("json_path")
+        or row.get("audio_path")
+        or row.get("output_audio_path")
+        or ""
+    )
+    generation_mode = str(row.get("generation_mode") or "")
+    return (str(preferred_path), generation_mode)
+
+
+def merge_root_asset_index(
+    existing_rows: Sequence[dict[str, Any]],
+    new_rows: Sequence[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    merged: dict[tuple[str, str], dict[str, Any]] = {
+        asset_index_identity(row): dict(row) for row in existing_rows
+    }
+    for row in new_rows:
+        merged[asset_index_identity(row)] = dict(row)
+    return list(merged.values())
+
+
+def build_summary_groups_from_index(
+    rows: Sequence[dict[str, Any]],
+    generation_mode: str,
+) -> list[dict[str, Any]]:
+    grouped: dict[str, dict[str, Any]] = {}
+    for row in rows:
+        if row.get("generation_mode") != generation_mode:
+            continue
+        transcript = str(row.get("transcript") or row.get("word") or "").strip()
+        if transcript not in grouped:
+            grouped[transcript] = {
+                "transcript": transcript,
+                "word": str(row.get("word") or transcript),
+                "generation_mode": generation_mode,
+                "generated_count": 0,
+                "items": [],
+            }
+        grouped[transcript]["items"].append(dict(row))
+
+    summaries: list[dict[str, Any]] = []
+    for transcript in sorted(grouped):
+        item = grouped[transcript]
+        item["items"].sort(
+            key=lambda entry: str(
+                entry.get("sidecar_path")
+                or entry.get("json_path")
+                or entry.get("audio_path")
+                or ""
+            )
+        )
+        item["generated_count"] = len(item["items"])
+        summaries.append(item)
+    return summaries
+
+
 def filter_generated_by_mode(generated: Sequence[dict[str, Any]], generation_mode: str) -> list[dict[str, Any]]:
     return [dict(item) for item in generated if item.get("generation_mode") == generation_mode]
 
@@ -1264,14 +1332,17 @@ def main() -> int:
                 task_results.append((task_index, result))
             generated = [result for _, result in sorted(task_results, key=lambda item: item[0])]
 
-    root_index = build_root_asset_index(generated)
-    (output_dir / "blabber_asset_index.json").write_text(json.dumps(root_index, indent=2), encoding="utf-8")
+    index_path = output_dir / "blabber_asset_index.json"
+    existing_root_index = load_existing_json_array(index_path)
+    current_root_index = build_root_asset_index(generated)
+    root_index = merge_root_asset_index(existing_root_index, current_root_index)
+    index_path.write_text(json.dumps(root_index, indent=2), encoding="utf-8")
     (output_dir / "global_summary.json").write_text(
-        json.dumps(filter_generated_by_mode(generated, ASSET_BANK_GLOBAL), indent=2),
+        json.dumps(build_summary_groups_from_index(root_index, ASSET_BANK_GLOBAL), indent=2),
         encoding="utf-8",
     )
     (output_dir / "per_phoneme_summary.json").write_text(
-        json.dumps(filter_generated_by_mode(generated, ASSET_BANK_PER_PHONEME), indent=2),
+        json.dumps(build_summary_groups_from_index(root_index, ASSET_BANK_PER_PHONEME), indent=2),
         encoding="utf-8",
     )
 

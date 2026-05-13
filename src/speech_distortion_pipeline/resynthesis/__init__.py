@@ -1,8 +1,10 @@
-from .factory import build_fragment_synthesizer
+from .factory import build_fragment_synthesizer, build_pronunciation_fragment_synthesizer
 from .fragment_synthesizer import (
     CoquiFragmentSynthesizer,
     FragmentSynthesizer,
     HeuristicFragmentSynthesizer,
+    HeuristicPronunciationFragmentSynthesizer,
+    PronunciationFragmentSynthesizer,
     SayFragmentSynthesizer,
 )
 from .phoneme_render_backend import (
@@ -38,6 +40,7 @@ __all__ = [
     "DEFAULT_STYLE_TRANSFER_PRESETS_PATH",
     "FragmentSynthesizer",
     "HeuristicFragmentSynthesizer",
+    "HeuristicPronunciationFragmentSynthesizer",
     "KOKORO_VOICE_OPTIONS",
     "PHONEME_RENDER_BACKENDS",
     "PHONEME_RENDER_BACKEND_COQUI_TACOTRON2_DDC_PH",
@@ -47,6 +50,7 @@ __all__ = [
     "PhonemeRenderError",
     "PhonemeRenderProbe",
     "PhonemeRenderResult",
+    "PronunciationFragmentSynthesizer",
     "SayFragmentSynthesizer",
     "STYLE_TRANSFER_BACKENDS",
     "STYLE_TRANSFER_BACKEND_NONE",
@@ -56,6 +60,7 @@ __all__ = [
     "apply_style_transfer",
     "backend_metadata",
     "build_fragment_synthesizer",
+    "build_pronunciation_fragment_synthesizer",
     "default_woman_phoneme_render_backend",
     "male_style_transfer_presets",
     "probe_phoneme_render_backend",

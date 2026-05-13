@@ -12,7 +12,17 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional, Protocol, Tuple
 
-from speech_distortion_pipeline.models import AudioBuffer, AudioSegment, EditPlan, EditType, PhoneGraph, PhoneNode, TimingPlan
+from speech_distortion_pipeline.models import (
+    AudioBuffer,
+    AudioSegment,
+    EditPlan,
+    EditType,
+    PhoneGraph,
+    PhoneNode,
+    PronunciationSafePlan,
+    TimingInstabilityPlan,
+    TimingPlan,
+)
 
 
 def resolve_conda_command() -> list[str]:
@@ -57,6 +67,15 @@ class FragmentSynthesizer(Protocol):
 
     def synthesize(
         self, audio: AudioBuffer, graph: PhoneGraph, plan: EditPlan, timing: TimingPlan
+    ) -> list[AudioSegment]:
+        raise NotImplementedError
+
+
+class PronunciationFragmentSynthesizer(Protocol):
+    """Synthesizes pronunciation-safe replacement fragments from slider plans."""
+
+    def synthesize(
+        self, audio: AudioBuffer, graph: PhoneGraph, plan: PronunciationSafePlan, timing: TimingInstabilityPlan
     ) -> list[AudioSegment]:
         raise NotImplementedError
 
@@ -276,6 +295,106 @@ class HeuristicFragmentSynthesizer:
 
     def _clamp(self, value: float) -> float:
         return max(-1.0, min(1.0, value))
+
+
+@dataclass
+class HeuristicPronunciationFragmentSynthesizer(HeuristicFragmentSynthesizer):
+    """Pronunciation-aware fragment synthesizer for slider-driven symbolic edits."""
+
+    synthesizer_name: str = "heuristic_pronunciation_fragment_synthesizer_v1"
+
+    def synthesize(
+        self, audio: AudioBuffer, graph: PhoneGraph, plan: PronunciationSafePlan, timing: TimingInstabilityPlan
+    ) -> list[AudioSegment]:
+        node_map = {node.index: node for node in graph.nodes}
+        clarity_mix = float(plan.clarity_plan.parameters.get("breath_noise_mix", 0.0))
+        fricative_smearing = float(plan.clarity_plan.parameters.get("fricative_smearing", 0.0))
+        timing_budget_map = {budget.window_start_phone_index: budget for budget in timing.budgets}
+        fragments: List[AudioSegment] = []
+
+        for operation in plan.operations:
+            if operation.edit_type not in {EditType.SUBSTITUTE, EditType.DISTORTED_SUBSTITUTE, EditType.ADD}:
+                continue
+            if not operation.target_phone_indices:
+                continue
+
+            target_index = operation.target_phone_indices[0]
+            target_node = node_map.get(target_index)
+            if target_node is None:
+                continue
+
+            start_sec = float(target_node.start_sec or 0.0)
+            end_sec = float(target_node.end_sec or (start_sec + 0.06))
+            if target_index in timing.pause_after_phone_indices:
+                end_sec += 0.015
+            budget = timing_budget_map.get(target_index)
+            if budget is not None:
+                end_sec += max(0.0, budget.compensated_delta_sec)
+
+            phones = self._phones_for_pronunciation_operation(target_node, operation)
+            distorted = operation.edit_type == EditType.DISTORTED_SUBSTITUTE or "surface_distortion_only" in operation.notes
+            samples = self._render_phone_sequence(
+                phones=phones,
+                sample_rate_hz=audio.sample_rate_hz,
+                duration_sec=max(0.03, end_sec - start_sec),
+                distorted=distorted,
+                seed=(target_index * 17) + len(phones),
+            )
+            samples = self._shape_fragment(samples, clarity_mix, fricative_smearing, target_node, distorted)
+            label = "{0}:{1}".format(operation.edit_type.value, "-".join(phones))
+            if target_index in timing.micro_stutter_phone_indices:
+                label += ":micro_stutter"
+            if target_index in timing.onset_repeat_phone_indices:
+                label += ":onset_repeat"
+            fragments.append(
+                AudioSegment(
+                    start_sec=start_sec,
+                    end_sec=end_sec,
+                    samples=samples,
+                    label=label,
+                    source=self.synthesizer_name,
+                )
+            )
+
+        return fragments
+
+    def _phones_for_pronunciation_operation(self, target_node: PhoneNode, operation) -> List[str]:
+        if operation.edit_type == EditType.ADD:
+            phones = list(operation.inserted_phones)
+            if not phones:
+                phones = ["AH"]
+            return phones + [target_node.phone]
+        if operation.replacement_phones:
+            return list(operation.replacement_phones)
+        return [target_node.phone]
+
+    def _shape_fragment(
+        self,
+        samples: List[float],
+        clarity_mix: float,
+        fricative_smearing: float,
+        target_node: PhoneNode,
+        distorted: bool,
+    ) -> List[float]:
+        shaped = list(samples)
+        if clarity_mix > 0.0:
+            shaped = [self._clamp((sample * (1.0 - clarity_mix)) + (0.02 * clarity_mix)) for sample in shaped]
+        if target_node.features.manner == "fricative" and fricative_smearing > 0.0:
+            shaped = self._smooth_sequence(shaped, max(2, int(round(3 + (fricative_smearing * 5)))))
+        if distorted:
+            shaped = [self._clamp(sample * (0.82 if (index // 9) % 2 == 0 else 0.58)) for index, sample in enumerate(shaped)]
+        return shaped
+
+    def _smooth_sequence(self, samples: List[float], radius: int) -> List[float]:
+        if radius <= 1 or len(samples) < 3:
+            return list(samples)
+        output: List[float] = []
+        for index in range(len(samples)):
+            start = max(0, index - radius)
+            end = min(len(samples), index + radius + 1)
+            window = samples[start:end]
+            output.append(sum(window) / float(len(window)))
+        return output
 
 
 @dataclass

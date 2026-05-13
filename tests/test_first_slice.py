@@ -2,6 +2,7 @@ from pathlib import Path
 
 from speech_distortion_pipeline.alignment import build_aligner
 from speech_distortion_pipeline.bootstrap import (
+    build_speech_distortion_pipeline,
     build_editing_slice,
     build_phonology_slice,
     build_planning_slice,
@@ -10,7 +11,7 @@ from speech_distortion_pipeline.bootstrap import (
     build_timbre_slice,
     build_timing_slice,
 )
-from speech_distortion_pipeline.config import load_config
+from speech_distortion_pipeline.config import load_config, load_pronunciation_slider_config
 from speech_distortion_pipeline.io import WavAudioReader
 from speech_distortion_pipeline.models import EditType
 
@@ -209,3 +210,42 @@ def test_timbre_slice_projects_fragment_samples() -> None:
     assert len(projected) == len(fragments)
     assert all(fragment.source == "heuristic_timbre_projector_v1" for fragment in projected)
     assert any((projected[i].samples or []) != (fragments[i].samples or []) for i in range(len(fragments)))
+
+
+def test_migrated_pipeline_plan_only_bridges_to_pronunciation_safe_operations() -> None:
+    root = Path(__file__).resolve().parents[1]
+    config = load_config(root / "configs" / "pipeline.example.yaml")
+    pronunciation_config = load_pronunciation_slider_config(root / "pronunciation_sliders.yaml")
+    pipeline = build_speech_distortion_pipeline(
+        config,
+        pronunciation_config=pronunciation_config,
+        prefer_pronunciation_safe=True,
+    )
+    severity = build_planning_slice(config).severity_profile
+    audio = WavAudioReader().read(str(root / "yes_slow.wav"))
+
+    plan = pipeline.plan_only(audio, "rabbit blue string", severity)
+
+    assert plan.planner_name == "migration_pronunciation_safe_bridge"
+    assert isinstance(plan.operations, list)
+
+
+def test_migrated_pipeline_run_emits_pronunciation_bridge_metadata() -> None:
+    root = Path(__file__).resolve().parents[1]
+    config = load_config(root / "configs" / "pipeline.example.yaml")
+    pronunciation_config = load_pronunciation_slider_config(root / "pronunciation_sliders.yaml")
+    pipeline = build_speech_distortion_pipeline(
+        config,
+        pronunciation_config=pronunciation_config,
+        prefer_pronunciation_safe=True,
+    )
+    severity = build_stitching_slice(config).severity_profile
+    audio = WavAudioReader().read(str(root / "yes_slow.wav"))
+
+    rendered = pipeline.run(audio, "rabbit blue string", severity)
+
+    assert rendered.samples
+    assert rendered.metadata["migration_mode"] == "pronunciation_safe_bridge"
+    assert float(rendered.metadata["pronunciation_similarity_score"]) >= float(
+        rendered.metadata["pronunciation_similarity_threshold"]
+    )

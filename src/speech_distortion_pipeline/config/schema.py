@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from typing import Optional
 
 
 @dataclass
@@ -69,3 +70,116 @@ class PipelineConfig:
     resynthesis: ResynthesisConfig
     timbre: TimbreConfig
     stitching: StitchingConfig
+
+
+@dataclass
+class RangeConfig:
+    min: float
+    max: float
+    meaning: Optional[str] = None
+
+
+@dataclass
+class GlobalConstraintsConfig:
+    slider_range: RangeConfig
+    time_range: RangeConfig
+    preserve_core_pronunciation: bool
+    allow_full_gibberish: bool
+    minimum_pronunciation_similarity: float
+    minimum_pronunciation_similarity_short_word: float
+    max_total_duration_drift_ratio: float
+    random_seed: int
+
+
+@dataclass
+class AnchorSelectionRulesConfig:
+    always_anchor_primary_vowel: bool
+    always_anchor_first_content_consonant: bool
+    anchor_final_consonant_for_closed_syllables: bool
+    short_word_anchor_all_phones_when_phone_count_lte: int
+
+
+@dataclass
+class PronunciationSkeletonConfig:
+    extract: list[str]
+    anchor_selection_rules: AnchorSelectionRulesConfig
+
+
+@dataclass
+class PronunciationSimilarityWeightsConfig:
+    anchor_phone_preservation: float
+    vowel_nucleus_similarity: float
+    syllable_count_similarity: float
+    phone_order_similarity: float
+    duration_shape_similarity: float
+
+
+@dataclass
+class PronunciationSimilarityScoreConfig:
+    range: list[float]
+    weights: PronunciationSimilarityWeightsConfig
+    repair_order: list[str]
+
+
+@dataclass
+class ShortWordModeConfig:
+    enabled_when_phone_count_lte: int
+    max_phone_substitution_ratio: float
+    max_deletions_per_word: int
+    preserve_first_phone: bool
+    preserve_primary_vowel_nucleus: bool
+
+
+@dataclass
+class SliderGuardrailsConfig:
+    values: dict[str, object] = field(default_factory=dict)
+    short_word_mode: Optional[ShortWordModeConfig] = None
+
+
+@dataclass
+class SliderConfig:
+    label: str
+    default: float
+    user_description: str
+    independence_rule: str
+    pronunciation_guardrails: SliderGuardrailsConfig
+    generated_parameters: dict[str, object] = field(default_factory=dict)
+    allowed_examples_for_no: list[str] = field(default_factory=list)
+    disallowed_examples_for_no: list[str] = field(default_factory=list)
+
+
+@dataclass
+class ProcessingStageConfig:
+    id: str
+    outputs: list[str] = field(default_factory=list)
+    uses: list[str] = field(default_factory=list)
+    condition: Optional[str] = None
+
+
+@dataclass
+class OverrideModeConfig:
+    values: dict[str, object] = field(default_factory=dict)
+
+
+@dataclass
+class AcceptanceTestConfig:
+    name: str
+    word: str
+    phones: list[str]
+    controls: dict[str, float]
+    expected: str
+
+
+@dataclass
+class PronunciationSliderConfig:
+    version: int
+    kind: str
+    name: str
+    description: str
+    global_constraints: GlobalConstraintsConfig
+    pronunciation_skeleton: PronunciationSkeletonConfig
+    pronunciation_similarity_score: PronunciationSimilarityScoreConfig
+    sliders: dict[str, SliderConfig]
+    processing_pipeline: list[ProcessingStageConfig] = field(default_factory=list)
+    override_modes: dict[str, OverrideModeConfig] = field(default_factory=dict)
+    acceptance_tests: list[AcceptanceTestConfig] = field(default_factory=list)

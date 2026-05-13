@@ -1,10 +1,17 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Optional, Union
 
 from speech_distortion_pipeline.alignment import Aligner, build_aligner
-from speech_distortion_pipeline.config import PipelineConfig
-from speech_distortion_pipeline.editing import SourceSegmentEditor, build_source_editor
+from speech_distortion_pipeline.config import AlignmentConfig, PhonologyConfig, PipelineConfig, PronunciationSliderConfig
+from speech_distortion_pipeline.editing import (
+    PronunciationSourceEditor,
+    SourceSegmentEditor,
+    build_pronunciation_source_editor,
+    build_source_editor,
+)
+from speech_distortion_pipeline.io import WavAudioReader
 from speech_distortion_pipeline.phonology import (
     ComplexityScorer,
     FeatureExtractor,
@@ -15,17 +22,28 @@ from speech_distortion_pipeline.phonology import (
 )
 from speech_distortion_pipeline.planning import (
     ErrorPlanner,
+    PronunciationPlanner,
     build_error_planner,
+    build_pronunciation_planner,
     build_severity_profile_from_config,
 )
 from speech_distortion_pipeline.resynthesis import (
     FragmentSynthesizer,
+    PronunciationFragmentSynthesizer,
     build_fragment_synthesizer,
+    build_pronunciation_fragment_synthesizer,
 )
 from speech_distortion_pipeline.stitching import AudioAssembler, build_audio_assembler
 from speech_distortion_pipeline.timbre import TimbreProjector, build_timbre_projector
-from speech_distortion_pipeline.models import SeverityProfile
-from speech_distortion_pipeline.timing import DurationBudgetManager, build_duration_budget_manager
+from speech_distortion_pipeline.models import SeverityProfile, SliderControls
+from speech_distortion_pipeline.models import AcceptanceCaseResult, PronunciationAcceptanceReport
+from speech_distortion_pipeline.timing import (
+    DurationBudgetManager,
+    PronunciationTimingPlanner,
+    build_duration_budget_manager,
+    build_pronunciation_timing_planner,
+)
+from speech_distortion_pipeline.orchestration import SpeechDistortionPipeline
 
 
 @dataclass
@@ -229,4 +247,281 @@ def build_timbre_slice(config: PipelineConfig) -> TimbreSlice:
         budget_manager=resynthesis.budget_manager,
         fragment_synthesizer=resynthesis.fragment_synthesizer,
         timbre_projector=build_timbre_projector(),
+    )
+
+
+@dataclass
+class PronunciationPlanningSlice:
+    config: PronunciationSliderConfig
+    aligner: Aligner
+    g2p: GraphemeToPhoneme
+    feature_extractor: FeatureExtractor
+    planner: PronunciationPlanner
+
+
+def build_pronunciation_planning_slice(config: PronunciationSliderConfig) -> PronunciationPlanningSlice:
+    alignment = AlignmentConfig(
+        runtime_backend="torchaudio_ctc",
+        offline_backend="mfa",
+        emit_phone_confidence=False,
+    )
+    phonology = PhonologyConfig(
+        g2p_backend="espeak_ng",
+        language="en-us",
+        compute_complexity=False,
+    )
+    g2p = build_grapheme_to_phoneme(phonology)
+    return PronunciationPlanningSlice(
+        config=config,
+        aligner=build_aligner(alignment),
+        g2p=g2p,
+        feature_extractor=build_feature_extractor(phonology, g2p),
+        planner=build_pronunciation_planner(config),
+    )
+
+
+@dataclass
+class PronunciationTimingSlice:
+    config: PronunciationSliderConfig
+    aligner: Aligner
+    g2p: GraphemeToPhoneme
+    feature_extractor: FeatureExtractor
+    planner: PronunciationPlanner
+    timing_planner: PronunciationTimingPlanner
+
+
+def build_pronunciation_timing_slice(config: PronunciationSliderConfig) -> PronunciationTimingSlice:
+    planning = build_pronunciation_planning_slice(config)
+    return PronunciationTimingSlice(
+        config=config,
+        aligner=planning.aligner,
+        g2p=planning.g2p,
+        feature_extractor=planning.feature_extractor,
+        planner=planning.planner,
+        timing_planner=build_pronunciation_timing_planner(config),
+    )
+
+
+@dataclass
+class PronunciationEditingSlice:
+    config: PronunciationSliderConfig
+    aligner: Aligner
+    g2p: GraphemeToPhoneme
+    feature_extractor: FeatureExtractor
+    planner: PronunciationPlanner
+    timing_planner: PronunciationTimingPlanner
+    source_editor: PronunciationSourceEditor
+
+
+def build_pronunciation_editing_slice(config: PronunciationSliderConfig) -> PronunciationEditingSlice:
+    timing = build_pronunciation_timing_slice(config)
+    return PronunciationEditingSlice(
+        config=config,
+        aligner=timing.aligner,
+        g2p=timing.g2p,
+        feature_extractor=timing.feature_extractor,
+        planner=timing.planner,
+        timing_planner=timing.timing_planner,
+        source_editor=build_pronunciation_source_editor(),
+    )
+
+
+@dataclass
+class PronunciationResynthesisSlice:
+    config: PronunciationSliderConfig
+    aligner: Aligner
+    g2p: GraphemeToPhoneme
+    feature_extractor: FeatureExtractor
+    planner: PronunciationPlanner
+    timing_planner: PronunciationTimingPlanner
+    source_editor: PronunciationSourceEditor
+    fragment_synthesizer: PronunciationFragmentSynthesizer
+
+
+def build_pronunciation_resynthesis_slice(config: PronunciationSliderConfig) -> PronunciationResynthesisSlice:
+    editing = build_pronunciation_editing_slice(config)
+    return PronunciationResynthesisSlice(
+        config=config,
+        aligner=editing.aligner,
+        g2p=editing.g2p,
+        feature_extractor=editing.feature_extractor,
+        planner=editing.planner,
+        timing_planner=editing.timing_planner,
+        source_editor=editing.source_editor,
+        fragment_synthesizer=build_pronunciation_fragment_synthesizer(),
+    )
+
+
+@dataclass
+class PronunciationTimbreSlice:
+    config: PronunciationSliderConfig
+    aligner: Aligner
+    g2p: GraphemeToPhoneme
+    feature_extractor: FeatureExtractor
+    planner: PronunciationPlanner
+    timing_planner: PronunciationTimingPlanner
+    source_editor: PronunciationSourceEditor
+    fragment_synthesizer: PronunciationFragmentSynthesizer
+    timbre_projector: TimbreProjector
+
+
+def build_pronunciation_timbre_slice(config: PronunciationSliderConfig) -> PronunciationTimbreSlice:
+    resynthesis = build_pronunciation_resynthesis_slice(config)
+    return PronunciationTimbreSlice(
+        config=config,
+        aligner=resynthesis.aligner,
+        g2p=resynthesis.g2p,
+        feature_extractor=resynthesis.feature_extractor,
+        planner=resynthesis.planner,
+        timing_planner=resynthesis.timing_planner,
+        source_editor=resynthesis.source_editor,
+        fragment_synthesizer=resynthesis.fragment_synthesizer,
+        timbre_projector=build_timbre_projector(),
+    )
+
+
+@dataclass
+class PronunciationStitchingSlice:
+    config: PronunciationSliderConfig
+    aligner: Aligner
+    g2p: GraphemeToPhoneme
+    feature_extractor: FeatureExtractor
+    planner: PronunciationPlanner
+    timing_planner: PronunciationTimingPlanner
+    source_editor: PronunciationSourceEditor
+    fragment_synthesizer: PronunciationFragmentSynthesizer
+    timbre_projector: TimbreProjector
+    assembler: AudioAssembler
+
+
+def build_pronunciation_stitching_slice(config: PronunciationSliderConfig) -> PronunciationStitchingSlice:
+    timbre = build_pronunciation_timbre_slice(config)
+    return PronunciationStitchingSlice(
+        config=timbre.config,
+        aligner=timbre.aligner,
+        g2p=timbre.g2p,
+        feature_extractor=timbre.feature_extractor,
+        planner=timbre.planner,
+        timing_planner=timbre.timing_planner,
+        source_editor=timbre.source_editor,
+        fragment_synthesizer=timbre.fragment_synthesizer,
+        timbre_projector=timbre.timbre_projector,
+        assembler=build_audio_assembler(),
+    )
+
+
+def build_slider_controls(
+    config: PronunciationSliderConfig, **overrides: Optional[Union[float, bool]]
+) -> SliderControls:
+    allow_full_gibberish = overrides.get("allow_full_gibberish")
+    return SliderControls(
+        jibberish=float(overrides.get("jibberish", config.sliders["jibberish"].default)),
+        clarity=float(overrides.get("clarity", config.sliders["clarity"].default)),
+        timing_instability=float(
+            overrides.get("timing_instability", config.sliders["timing_instability"].default)
+        ),
+        allow_full_gibberish=(
+            bool(allow_full_gibberish)
+            if allow_full_gibberish is not None
+            else bool(config.global_constraints.allow_full_gibberish)
+        ),
+    )
+
+
+def map_severity_to_slider_controls(severity: SeverityProfile) -> SliderControls:
+    def clamp_unit(value: float) -> float:
+        return max(0.0, min(1.0, float(value)))
+
+    jibberish = clamp_unit(
+        (severity.global_severity * 0.40)
+        + (severity.substitution_bias * 0.35)
+        + (severity.addition_bias * 0.25)
+    )
+    clarity = clamp_unit(
+        (severity.distortion_bias * 0.55)
+        + (severity.global_severity * 0.25)
+        + (severity.complexity_slope * 0.20)
+    )
+    timing_instability = clamp_unit(
+        ((severity.vowel_lengthening_bias + severity.consonant_lengthening_bias) * 0.35)
+        + (severity.global_severity * 0.30)
+        + (severity.complexity_slope * 0.10)
+    )
+    return SliderControls(
+        jibberish=jibberish,
+        clarity=clarity,
+        timing_instability=timing_instability,
+        allow_full_gibberish=False,
+    )
+
+
+def run_pronunciation_acceptance_report(
+    config: PronunciationSliderConfig, audio_path: str
+) -> PronunciationAcceptanceReport:
+    audio = WavAudioReader().read(audio_path)
+    planning = build_pronunciation_planning_slice(config)
+    timing = build_pronunciation_timing_slice(config)
+    case_results = []
+
+    for case in config.acceptance_tests:
+        alignment = planning.aligner.align(audio, case.word)
+        graph = planning.feature_extractor.build_phone_graph(alignment)
+        controls = build_slider_controls(config, **case.controls)
+        plan = planning.planner.plan(graph, controls)
+        timing_plan = timing.timing_planner.build(graph, plan)
+        case_results.append(
+            AcceptanceCaseResult(
+                name=case.name,
+                word=case.word,
+                expected=case.expected,
+                passed=plan.similarity.passed and timing_plan.preserve_phone_order,
+                similarity_score=plan.similarity.score,
+                similarity_threshold=plan.similarity.threshold,
+                operation_count=len(plan.operations),
+                timing_budget_count=len(timing_plan.budgets),
+                preserve_phone_order=timing_plan.preserve_phone_order,
+            )
+        )
+
+    return PronunciationAcceptanceReport(config_name=config.name, case_results=case_results)
+
+
+def build_speech_distortion_pipeline(
+    config: PipelineConfig,
+    *,
+    pronunciation_config: Optional[PronunciationSliderConfig] = None,
+    prefer_pronunciation_safe: bool = False,
+) -> SpeechDistortionPipeline:
+    stitching = build_stitching_slice(config)
+    if pronunciation_config is None:
+        return SpeechDistortionPipeline(
+            aligner=stitching.aligner,
+            feature_extractor=stitching.feature_extractor,
+            complexity_scorer=stitching.complexity_scorer,
+            planner=stitching.planner,
+            budget_manager=stitching.budget_manager,
+            source_editor=stitching.source_editor,
+            fragment_synthesizer=stitching.fragment_synthesizer,
+            timbre_projector=stitching.timbre_projector,
+            assembler=stitching.assembler,
+            prefer_pronunciation_safe=False,
+        )
+
+    pronunciation = build_pronunciation_stitching_slice(pronunciation_config)
+    return SpeechDistortionPipeline(
+        aligner=stitching.aligner,
+        feature_extractor=stitching.feature_extractor,
+        complexity_scorer=stitching.complexity_scorer,
+        planner=stitching.planner,
+        budget_manager=stitching.budget_manager,
+        source_editor=stitching.source_editor,
+        fragment_synthesizer=stitching.fragment_synthesizer,
+        timbre_projector=stitching.timbre_projector,
+        assembler=stitching.assembler,
+        pronunciation_planner=pronunciation.planner,
+        pronunciation_timing_planner=pronunciation.timing_planner,
+        pronunciation_source_editor=pronunciation.source_editor,
+        pronunciation_fragment_synthesizer=pronunciation.fragment_synthesizer,
+        pronunciation_timbre_projector=pronunciation.timbre_projector,
+        prefer_pronunciation_safe=prefer_pronunciation_safe,
     )

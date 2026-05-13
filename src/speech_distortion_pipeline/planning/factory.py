@@ -1,8 +1,9 @@
 from __future__ import annotations
 
+from speech_distortion_pipeline.config import PronunciationSliderConfig
 from speech_distortion_pipeline.models import SeverityProfile
 
-from .planner import ErrorPlanner, HeuristicErrorPlanner
+from .planner import ErrorPlanner, HeuristicErrorPlanner, HeuristicPronunciationPlanner, PronunciationPlanner
 
 
 def build_severity_profile(
@@ -39,3 +40,7 @@ def build_severity_profile_from_config(config: object) -> SeverityProfile:
 
 def build_error_planner() -> ErrorPlanner:
     return HeuristicErrorPlanner()
+
+
+def build_pronunciation_planner(config: PronunciationSliderConfig) -> PronunciationPlanner:
+    return HeuristicPronunciationPlanner(config=config)

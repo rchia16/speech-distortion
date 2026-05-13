@@ -8,6 +8,9 @@ Guide:
 """
 from pathlib import Path
 import pprint
+from os import makedirs
+from os.path import join, exists
+import pickle
 
 from Template_l2_compare_v2 import (
     compare_signal_to_prebuilt_template,
@@ -44,24 +47,43 @@ if __name__ == "__main__":
     """
     template_days = [1]
     template_sessions = range(1, 8)
+    template_directory = '/data/raqchia/imaged-speech/eeg-templates'
+    template_fname = 'template.pkl'
+
     label = 0
-
-    template_object = build_template_from_dataset(
-        template_days=template_days,
-        template_sessions=template_sessions,
-        nperseg=128,
-        noverlap=96,
-        eps=1e-8,
-        fmax=50,
-    )
-
+    test_day = 1
+    test_template_fname = join(template_directory, f'day{test_day}', template_fname)
+    
+    for day in template_days:
+        template_day_dir = join(template_directory, f'day{day}')
+        makedirs(template_day_dir, exist_ok=True)
+        template_fname_out = join(template_day_dir, template_fname)
+        if exists(template_fname_out):
+            print("already exists, skipping template creation")
+            continue
+        template_object = build_template_from_dataset(
+            template_days=template_days,
+            template_sessions=template_sessions,
+            nperseg=128,
+            noverlap=96,
+            eps=1e-8,
+            fmax=50,
+        )
+        with open(template_fname_out, 'wb') as f:
+            pickle.dump(template_object, f)
+            
     trial, label_name, dataset = get_one_trial_from_dataset(
-        day=1,
+        day=test_day,
         sess=8,
         label=label,
         trial_index_within_label=0,
     )
     print("Loaded trial label:", label_name)
+
+    # get template object according to day and label
+    print(template_fname_out)
+    with open(test_template_fname, 'rb') as f:
+        template_object = pickle.load(f)
 
     result = compare_signal_to_prebuilt_template(
         template_object=template_object,

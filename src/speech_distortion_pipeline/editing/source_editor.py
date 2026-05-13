@@ -3,7 +3,16 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Protocol, Tuple
 
-from speech_distortion_pipeline.models import AudioBuffer, EditPlan, EditType, PhoneGraph, PhoneNode, TimingPlan
+from speech_distortion_pipeline.models import (
+    AudioBuffer,
+    EditPlan,
+    EditType,
+    PhoneGraph,
+    PhoneNode,
+    PronunciationSafePlan,
+    TimingInstabilityPlan,
+    TimingPlan,
+)
 
 
 class SourceSegmentEditor(Protocol):
@@ -11,6 +20,15 @@ class SourceSegmentEditor(Protocol):
 
     def apply(
         self, audio: AudioBuffer, graph: PhoneGraph, plan: EditPlan, timing: TimingPlan
+    ) -> AudioBuffer:
+        raise NotImplementedError
+
+
+class PronunciationSourceEditor(Protocol):
+    """Applies pronunciation-safe symbolic edits plus clarity and timing-instability shaping."""
+
+    def apply(
+        self, audio: AudioBuffer, graph: PhoneGraph, plan: PronunciationSafePlan, timing: TimingInstabilityPlan
     ) -> AudioBuffer:
         raise NotImplementedError
 
@@ -257,3 +275,194 @@ class HeuristicSourceSegmentEditor:
 
     def _clamp_value(self, value: float) -> float:
         return max(-1.0, min(1.0, value))
+
+
+@dataclass
+class HeuristicPronunciationSourceEditor(HeuristicSourceSegmentEditor):
+    """Pronunciation-aware source editor built on top of the bootstrap segment editor."""
+
+    editor_name: str = "heuristic_pronunciation_source_editor_v1"
+
+    def apply(
+        self, audio: AudioBuffer, graph: PhoneGraph, plan: PronunciationSafePlan, timing: TimingInstabilityPlan
+    ) -> AudioBuffer:
+        edited = list(audio.samples)
+        node_spans = self._node_spans(graph, len(edited), audio.sample_rate_hz)
+
+        for operation in plan.operations:
+            if not operation.target_phone_indices:
+                continue
+            target_index = operation.target_phone_indices[0]
+            span = node_spans.get(target_index)
+            if span is None:
+                continue
+            segment = edited[span[0] : span[1]]
+            if not segment:
+                continue
+            transformed = self._transform_segment(segment, operation.edit_type)
+            edited[span[0] : span[1]] = transformed[: len(segment)]
+
+        edited = self._apply_clarity_plan(edited, plan, graph, node_spans)
+        edited = self._apply_timing_instability(edited, graph, timing, node_spans, audio.sample_rate_hz)
+
+        return AudioBuffer(
+            samples=self._clamp(edited),
+            sample_rate_hz=audio.sample_rate_hz,
+            channel_count=audio.channel_count,
+            speaker_id=audio.speaker_id,
+            metadata={
+                **audio.metadata,
+                "editor_name": self.editor_name,
+                "pronunciation_operation_count": str(len(plan.operations)),
+                "clarity_parameter_count": str(len(plan.clarity_plan.parameters)),
+                "timing_budget_count": str(len(timing.budgets)),
+                "timing_pause_count": str(len(timing.pause_after_phone_indices)),
+                "timing_stutter_count": str(len(timing.micro_stutter_phone_indices)),
+                "timing_onset_repeat_count": str(len(timing.onset_repeat_phone_indices)),
+                "pronunciation_similarity_score": "{0:.4f}".format(plan.similarity.score),
+                "pronunciation_similarity_threshold": "{0:.4f}".format(plan.similarity.threshold),
+            },
+        )
+
+    def _apply_clarity_plan(
+        self,
+        samples: List[float],
+        plan: PronunciationSafePlan,
+        graph: PhoneGraph,
+        node_spans: Dict[int, Tuple[int, int]],
+    ) -> List[float]:
+        output = list(samples)
+        params = plan.clarity_plan.parameters
+        if not params:
+            return output
+
+        blur_ms = float(params.get("transition_blur_ms", 0.0))
+        blur_radius = max(1, int(round(blur_ms / 12.0)))
+        if blur_radius > 1:
+            output = self._moving_average(output, blur_radius)
+
+        high_freq_reduction = float(params.get("high_frequency_reduction", 0.0))
+        if high_freq_reduction > 0.0:
+            blurred = self._moving_average(output, max(2, blur_radius + 2))
+            output = [
+                self._clamp_value((sample * (1.0 - high_freq_reduction)) + (smooth * high_freq_reduction))
+                for sample, smooth in zip(output, blurred)
+            ]
+
+        breath_noise_mix = float(params.get("breath_noise_mix", 0.0))
+        if breath_noise_mix > 0.0:
+            output = self._inject_breath_noise(output, breath_noise_mix)
+
+        consonant_softening = float(params.get("consonant_burst_softening", 0.0))
+        fricative_smearing = float(params.get("fricative_smearing", 0.0))
+        for node in graph.nodes:
+            span = node_spans.get(node.index)
+            if span is None:
+                continue
+            start, end = span
+            segment = output[start:end]
+            if not segment:
+                continue
+            if node.features.manner == "stop" and consonant_softening > 0.0:
+                output[start:end] = self._soften_stop(segment, consonant_softening)
+            elif node.features.manner == "fricative" and fricative_smearing > 0.0:
+                smear_radius = max(2, int(round(3 + (fricative_smearing * 6))))
+                output[start:end] = self._moving_average(segment, smear_radius)[: len(segment)]
+            elif self._is_vowel(node.phone):
+                formant_centralization = float(params.get("formant_centralization", 0.0))
+                if formant_centralization > 0.0:
+                    output[start:end] = self._centralize_vowel(segment, formant_centralization)
+        return output
+
+    def _apply_timing_instability(
+        self,
+        samples: List[float],
+        graph: PhoneGraph,
+        timing: TimingInstabilityPlan,
+        node_spans: Dict[int, Tuple[int, int]],
+        sample_rate_hz: int,
+    ) -> List[float]:
+        output = list(samples)
+
+        for budget in sorted(timing.budgets, key=lambda item: item.window_start_phone_index, reverse=True):
+            window_span = self._window_span(budget.window_start_phone_index, budget.window_end_phone_index, node_spans)
+            if window_span is None:
+                continue
+            start_sample, end_sample = window_span
+            window = output[start_sample:end_sample]
+            if not window:
+                continue
+            scale = 1.0 + budget.requested_delta_sec
+            target_length = max(1, int(round(len(window) * scale)))
+            retimed = self._resample(window, target_length)
+            output[start_sample:end_sample] = self._resample(retimed, len(window))
+
+        for phone_index in timing.pause_after_phone_indices:
+            span = node_spans.get(phone_index)
+            if span is None:
+                continue
+            pause_len = max(1, int(round(sample_rate_hz * 0.015)))
+            start = min(len(output), span[1])
+            end = min(len(output), start + pause_len)
+            for idx in range(start, end):
+                output[idx] *= 0.12
+
+        for phone_index in timing.micro_stutter_phone_indices:
+            span = node_spans.get(phone_index)
+            if span is None:
+                continue
+            start, end = span
+            segment = output[start:end]
+            if not segment:
+                continue
+            output[start:end] = self._micro_stutter(segment)
+
+        for phone_index in timing.onset_repeat_phone_indices:
+            span = node_spans.get(phone_index)
+            if span is None:
+                continue
+            start, end = span
+            segment = output[start:end]
+            if len(segment) < 6:
+                continue
+            onset_len = max(2, len(segment) // 5)
+            onset = segment[:onset_len]
+            repeated = onset + segment[:-onset_len]
+            output[start:end] = self._resample(repeated, len(segment))
+
+        return output
+
+    def _inject_breath_noise(self, samples: List[float], mix: float) -> List[float]:
+        output: List[float] = []
+        state = 0.0
+        phase = 0
+        for value in samples:
+            phase += 1
+            pseudo_noise = (((phase * 1103515245) + 12345) % 2048) / 1024.0 - 1.0
+            state = (0.93 * state) + (0.07 * pseudo_noise)
+            output.append(self._clamp_value((value * (1.0 - mix)) + (state * 0.08 * mix)))
+        return output
+
+    def _soften_stop(self, samples: List[float], amount: float) -> List[float]:
+        softened = list(samples)
+        attack_len = max(1, len(softened) // 5)
+        for index in range(attack_len):
+            softened[index] *= max(0.25, 1.0 - amount)
+        return self._moving_average(softened, 2)
+
+    def _centralize_vowel(self, samples: List[float], amount: float) -> List[float]:
+        mean = sum(samples) / float(len(samples) or 1)
+        return [self._clamp_value((sample * (1.0 - amount * 0.5)) + (mean * amount * 0.5)) for sample in samples]
+
+    def _micro_stutter(self, samples: List[float]) -> List[float]:
+        output: List[float] = []
+        gate = max(2, len(samples) // 12)
+        for index, value in enumerate(samples):
+            if ((index // gate) % 3) == 1:
+                output.append(value * 0.2)
+            else:
+                output.append(value)
+        return output
+
+    def _is_vowel(self, phone: str) -> bool:
+        return phone in {"AE", "AH", "EH", "IH", "IY", "OW", "UW", "AY", "EY", "OY", "AW", "ER", "AA"}

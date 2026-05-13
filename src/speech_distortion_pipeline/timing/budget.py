@@ -3,7 +3,17 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Dict, List, Protocol
 
-from speech_distortion_pipeline.models import DurationBudget, EditPlan, EditType, PhoneGraph, PhoneNode, TimingPlan
+from speech_distortion_pipeline.config import PronunciationSliderConfig
+from speech_distortion_pipeline.models import (
+    DurationBudget,
+    EditPlan,
+    EditType,
+    PhoneGraph,
+    PhoneNode,
+    PronunciationSafePlan,
+    TimingInstabilityPlan,
+    TimingPlan,
+)
 
 
 class DurationBudgetManager(Protocol):
@@ -99,3 +109,83 @@ class HeuristicDurationBudgetManager:
 
     def _is_vowel(self, node: PhoneNode) -> bool:
         return node.phone in {"AE", "AH", "EH", "IH", "IY", "OW", "UW", "AY", "EY", "OY", "AW", "ER"}
+
+
+class PronunciationTimingPlanner(Protocol):
+    """Builds timing-instability directives under pronunciation-preserving guardrails."""
+
+    def build(self, graph: PhoneGraph, plan: PronunciationSafePlan) -> TimingInstabilityPlan:
+        raise NotImplementedError
+
+
+@dataclass
+class HeuristicPronunciationTimingPlanner:
+    config: PronunciationSliderConfig
+    planner_name: str = "heuristic_pronunciation_timing_planner_v1"
+
+    def build(self, graph: PhoneGraph, plan: PronunciationSafePlan) -> TimingInstabilityPlan:
+        controls = plan.controls
+        guardrails = self.config.sliders["timing_instability"].pronunciation_guardrails.values
+        by_word: Dict[int, List[PhoneNode]] = {}
+        for node in graph.nodes:
+            by_word.setdefault(node.word_index, []).append(node)
+
+        budgets: List[DurationBudget] = []
+        pause_after: List[int] = []
+        onset_repeats: List[int] = []
+        micro_stutters: List[int] = []
+
+        total_requested = 0.0
+        total_compensated = 0.0
+        max_drift = float(
+            guardrails.get(
+                "max_total_duration_drift_ratio",
+                self.config.global_constraints.max_total_duration_drift_ratio,
+            )
+        )
+        duration_scale = max_drift * controls.timing_instability
+
+        for skeleton in plan.skeletons:
+            nodes = by_word.get(skeleton.word_index, [])
+            if not nodes:
+                continue
+            start_index = nodes[0].index
+            end_index = nodes[-1].index
+            word_duration = sum(self._node_duration(node) for node in nodes)
+            requested = round(word_duration * duration_scale, 4)
+            compensated = round(min(requested, word_duration * 0.8), 4)
+            budgets.append(
+                DurationBudget(
+                    window_start_phone_index=start_index,
+                    window_end_phone_index=end_index,
+                    requested_delta_sec=requested,
+                    compensated_delta_sec=compensated,
+                    preserved_total_duration=compensated >= requested,
+                )
+            )
+            total_requested += requested
+            total_compensated += compensated
+
+            if controls.timing_instability >= 0.45:
+                micro_stutters.append(start_index)
+            if controls.timing_instability >= 0.55:
+                repeat_limit = int(guardrails.get("max_onset_repeats", 2))
+                onset_repeats.extend([start_index] * min(1, repeat_limit))
+            if controls.timing_instability >= 0.30:
+                pause_after.append(end_index)
+
+        return TimingInstabilityPlan(
+            budgets=budgets,
+            pause_after_phone_indices=pause_after,
+            onset_repeat_phone_indices=onset_repeats,
+            micro_stutter_phone_indices=micro_stutters,
+            total_requested_delta_sec=round(total_requested, 4),
+            total_compensated_delta_sec=round(total_compensated, 4),
+            max_total_duration_drift_ratio=max_drift,
+            preserve_phone_order=bool(guardrails.get("preserve_phone_order", True)),
+        )
+
+    def _node_duration(self, node: PhoneNode) -> float:
+        if node.start_sec is None or node.end_sec is None:
+            return 0.0
+        return max(0.0, float(node.end_sec) - float(node.start_sec))

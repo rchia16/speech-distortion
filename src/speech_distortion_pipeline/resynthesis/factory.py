@@ -6,6 +6,8 @@ from .fragment_synthesizer import (
     CoquiFragmentSynthesizer,
     FragmentSynthesizer,
     HeuristicFragmentSynthesizer,
+    HeuristicPronunciationFragmentSynthesizer,
+    PronunciationFragmentSynthesizer,
     SayFragmentSynthesizer,
 )
 
@@ -16,3 +18,7 @@ def build_fragment_synthesizer() -> FragmentSynthesizer:
     if shutil.which("say"):
         return SayFragmentSynthesizer()
     return HeuristicFragmentSynthesizer()
+
+
+def build_pronunciation_fragment_synthesizer() -> PronunciationFragmentSynthesizer:
+    return HeuristicPronunciationFragmentSynthesizer()

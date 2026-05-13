@@ -1,0 +1,226 @@
+version: 2
+kind: speech_distortion_agent
+name: pronunciation_safe_jibberish_clarity_timing_sliders
+description: Three independent speech distortion sliders with default guardrails that
+  preserve the core pronunciation of the target word.
+global_constraints:
+  slider_range:
+    min: 0.0
+    max: 1.0
+  time_range:
+    min: 0.0
+    max: 1.0
+    meaning: normalized_utterance_position
+  preserve_core_pronunciation: true
+  allow_full_gibberish: false
+  minimum_pronunciation_similarity: 0.72
+  minimum_pronunciation_similarity_short_word: 0.82
+  max_total_duration_drift_ratio: 0.12
+  random_seed: 7
+pronunciation_skeleton:
+  extract:
+  - phoneme_sequence
+  - anchor_phones
+  - primary_vowel_nucleus
+  - stress_bearing_phones
+  - syllable_count
+  - onset_rime_shape
+  - word_boundary_shape
+  - manner_classes
+  anchor_selection_rules:
+    always_anchor_primary_vowel: true
+    always_anchor_first_content_consonant: true
+    anchor_final_consonant_for_closed_syllables: true
+    short_word_anchor_all_phones_when_phone_count_lte: 3
+pronunciation_similarity_score:
+  range:
+  - 0.0
+  - 1.0
+  weights:
+    anchor_phone_preservation: 0.35
+    vowel_nucleus_similarity: 0.25
+    syllable_count_similarity: 0.15
+    phone_order_similarity: 0.15
+    duration_shape_similarity: 0.1
+  repair_order:
+  - restore_anchor_phones
+  - reduce_substitution_distance
+  - remove_deletions
+  - limit_insertions
+  - reduce_repetitions
+  - reduce_timing_fragmentation
+  - rescore
+sliders:
+  jibberish:
+    label: Jibberish
+    default: 0.0
+    user_description: Controls pronunciation drift around the original word while
+      preserving its core pronunciation by default.
+    independence_rule: Must not automatically reduce acoustic clarity or add timing
+      instability.
+    pronunciation_guardrails:
+      preserve_anchor_phones: true
+      preserve_primary_vowel_nucleus: true
+      preserve_syllable_count: true
+      preserve_phone_order: true
+      max_phone_substitution_ratio: 0.4
+      max_insertions_per_syllable: 1
+      max_deletions_per_word: 0
+      max_anchor_phone_distance: 1
+      max_non_anchor_phone_distance: 3
+      short_word_mode:
+        enabled_when_phone_count_lte: 3
+        max_phone_substitution_ratio: 0.25
+        max_deletions_per_word: 0
+        preserve_first_phone: true
+        preserve_primary_vowel_nucleus: true
+    generated_parameters:
+      substitution_probability: pow(jibberish, 1.2) * 0.60
+      substitution_distance: round(1 + jibberish * 3)
+      vowel_shift_probability: clamp((jibberish - 0.15) / 0.85, 0, 1) * 0.50
+      insertion_probability: clamp((jibberish - 0.45) / 0.55, 0, 1) * 0.30
+      deletion_probability: 0.0 unless allow_full_gibberish is true
+      repetition_probability: clamp((jibberish - 0.60) / 0.40, 0, 1) * 0.25
+    allowed_examples_for_no:
+    - 'no'
+    - noh
+    - nuh
+    - naw
+    - nuh-oh
+    - nyoh
+    - naw-uh
+    disallowed_examples_for_no:
+    - ka
+    - sho
+    - boo-tah
+    - meh-see
+  clarity:
+    label: Clarity
+    default: 0.0
+    user_description: Controls acoustic precision while preserving the intended phoneme
+      sequence.
+    independence_rule: Must not substitute, insert, delete, or reorder phonemes.
+    pronunciation_guardrails:
+      preserve_anchor_phones: true
+      preserve_primary_vowel_nucleus: true
+      preserve_syllable_count: true
+      max_formant_centralization_for_anchor_vowels: 0.45
+      min_consonant_burst_energy_ratio: 0.35
+      min_vowel_duration_ratio: 0.7
+      max_transition_blur_ms: 60
+    generated_parameters:
+      formant_centralization: min(clarity * 0.70, anchor_vowel_limit)
+      spectral_tilt_db_per_octave: clarity * -5.0
+      high_frequency_reduction: clarity * 0.80
+      consonant_burst_softening: min(pow(clarity, 1.1) * 0.90, 1 - min_consonant_burst_energy_ratio)
+      fricative_smearing: clarity * 0.85
+      transition_blur_ms: min(5 + clarity * 55, max_transition_blur_ms)
+      breath_noise_mix: clarity * 0.12
+  timing_instability:
+    label: Timing Instability
+    default: 0.0
+    user_description: Controls temporal irregularity while preserving phone order
+      and word identity.
+    independence_rule: Must not automatically change phoneme identity or acoustic
+      clarity.
+    pronunciation_guardrails:
+      preserve_phone_order: true
+      preserve_anchor_phones: true
+      max_phone_duration_scale: 1.8
+      min_phone_duration_scale: 0.55
+      max_onset_repeats: 2
+      max_pause_ms_inside_short_word: 180
+      max_total_duration_drift_ratio: 0.12
+      max_fragment_repetition_count: 2
+    generated_parameters:
+      phone_duration_jitter: timing_instability * 0.35
+      syllable_duration_jitter: timing_instability * 0.25
+      pause_insertion_probability: clamp((timing_instability - 0.30) / 0.70, 0, 1)
+        * 0.35
+      pause_duration_ms: min(20 + timing_instability * 180, max_pause_ms_inside_short_word_for_short_words)
+      micro_stutter_probability: clamp((timing_instability - 0.45) / 0.55, 0, 1) *
+        0.45
+      onset_repeat_probability: clamp((timing_instability - 0.55) / 0.45, 0, 1) *
+        0.35
+      fragment_reversal_probability: 0.0 unless experimental_mode is true
+processing_pipeline:
+- id: load_target_pronunciation
+  outputs:
+  - target_phones
+  - syllables
+- id: extract_pronunciation_skeleton
+  outputs:
+  - anchor_phones
+  - primary_vowel_nucleus
+  - protection_map
+- id: parse_slider_envelopes
+  outputs:
+  - slider_curves
+- id: dtw_align_query_to_template
+  outputs:
+  - template_time_curve
+  - residual_curve
+  - warp_curve
+- id: plan_jibberish
+  uses:
+  - jibberish
+  - protection_map
+  outputs:
+  - linguistic_edit_plan
+- id: plan_timing
+  uses:
+  - timing_instability
+  - protection_map
+  outputs:
+  - timing_edit_plan
+- id: score_pronunciation_similarity
+  outputs:
+  - pronunciation_similarity
+- id: repair_unsafe_edits
+  condition: pronunciation_similarity < threshold
+- id: render_or_splice
+- id: apply_clarity
+  uses:
+  - clarity
+  - protection_map
+- id: smooth_normalize_export
+override_modes:
+  full_gibberish:
+    allow_full_gibberish: true
+    minimum_pronunciation_similarity: 0.25
+    preserve_anchor_phones: false
+    preserve_syllable_count: false
+acceptance_tests:
+- name: high_jibberish_preserves_no_core
+  word: 'no'
+  phones:
+  - N
+  - OW
+  controls:
+    jibberish: 1.0
+    clarity: 0.0
+    timing_instability: 0.0
+  expected: strange_variant_of_no_not_unrelated_word
+- name: high_clarity_preserves_stop_structure
+  word: stop
+  phones:
+  - S
+  - T
+  - AA
+  - P
+  controls:
+    jibberish: 0.0
+    clarity: 1.0
+    timing_instability: 0.0
+  expected: slurred_stop_with_s_t_aa_p_structure
+- name: high_timing_preserves_yes_order
+  word: 'yes'
+  phones:
+  - Y
+  - EH
+  - S
+  controls:
+    jibberish: 0.0
+    clarity: 0.0
+    timing_instability: 1.0
+  expected: stuttered_or_stretched_yes_preserving_y_eh_s_order

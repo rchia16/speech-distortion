@@ -26,6 +26,8 @@ if str(SRC) not in sys.path:
 from speech_distortion_pipeline.io import WavAudioReader, WavAudioWriter
 from speech_distortion_pipeline.models import AudioBuffer
 from speech_distortion_pipeline.models.edits import EditType
+from speech_distortion_pipeline.bootstrap import build_pronunciation_stitching_slice, build_slider_controls
+from speech_distortion_pipeline.config import load_pronunciation_slider_config
 from speech_distortion_pipeline.phonology.blabber_config import (
     BLABBER_VOICE_MODES,
     COQUI_ENV_NAME,
@@ -71,6 +73,7 @@ from speech_distortion_pipeline.resynthesis.style_transfer import (
     male_style_transfer_presets,
 )
 DEFAULT_INPUT = ROOT / DEFAULT_GUI_INPUT_FILENAME
+DEFAULT_PRONUNCIATION_SLIDER_CONFIG = ROOT / "pronunciation_sliders.yaml"
 MAX_DROPOUT_FRACTION = 0.8
 MAX_DROPOUT_SILENCE_MS = 200.0
 GLOBAL_BLABBER_MAX_PHONEME_DISTANCE_VALUES = tuple(f"{value / 10.0:.1f}" for value in range(8, 101))
@@ -190,6 +193,11 @@ def subtitle_text_for_mode(mode: str) -> str:
         return (
             "Blabber synthesizes a mutated phone sequence. Breakpoints can be manual or 'auto' to crossfade by "
             "inferred phoneme segments."
+        )
+    if mode == "pronunciation_safe":
+        return (
+            "Pronunciation-safe sliders keep the target word recognizable while independently controlling "
+            "jibberish drift, acoustic clarity loss, and timing instability."
         )
     return "One augmentation at a time. Quality 1.0 keeps the original signal; 0.0 is worst quality."
 
@@ -1254,6 +1262,52 @@ def render_blabber_with_segments(
     return from_numpy(to_numpy(blabber), audio, **metadata)
 
 
+def render_pronunciation_safe(
+    audio: AudioBuffer,
+    transcript: str,
+    slider_config_path: Path = DEFAULT_PRONUNCIATION_SLIDER_CONFIG,
+    *,
+    jibberish: float,
+    clarity: float,
+    timing_instability: float,
+    allow_full_gibberish: bool = False,
+) -> AudioBuffer:
+    config = load_pronunciation_slider_config(slider_config_path)
+    runtime = build_pronunciation_stitching_slice(config)
+    alignment = runtime.aligner.align(audio, transcript)
+    graph = runtime.feature_extractor.build_phone_graph(alignment)
+    controls = build_slider_controls(
+        config,
+        jibberish=jibberish,
+        clarity=clarity,
+        timing_instability=timing_instability,
+        allow_full_gibberish=allow_full_gibberish,
+    )
+    plan = runtime.planner.plan(graph, controls)
+    timing = runtime.timing_planner.build(graph, plan)
+    edited = runtime.source_editor.apply(audio, graph, plan, timing)
+    fragments = runtime.fragment_synthesizer.synthesize(audio, graph, plan, timing)
+    projected = runtime.timbre_projector.project(audio, fragments)
+    stitched = runtime.assembler.assemble(audio, edited, projected)
+    metadata = dict(stitched.metadata)
+    metadata.update(
+        {
+            "augmentation": "pronunciation_safe",
+            "transcript": transcript.strip(),
+            "jibberish": f"{jibberish:.3f}",
+            "clarity": f"{clarity:.3f}",
+            "timing_instability": f"{timing_instability:.3f}",
+            "allow_full_gibberish": "1" if allow_full_gibberish else "0",
+            "pronunciation_similarity_score": f"{plan.similarity.score:.4f}",
+            "pronunciation_similarity_threshold": f"{plan.similarity.threshold:.4f}",
+            "pronunciation_fragment_count": str(len(projected)),
+            "pronunciation_repair_count": str(len(plan.repairs)),
+            "pronunciation_slider_config": str(slider_config_path),
+        }
+    )
+    return from_numpy(to_numpy(stitched), stitched, **metadata)
+
+
 def ensure_coqui_backend(env_name: str) -> None:
     completed = subprocess.run(
         resolve_python_command(env_name)
@@ -1307,6 +1361,10 @@ class SpeechDistortionGui:
         self.phone_style_noise_var = tk.StringVar(value="white")
         self.quality_mode_var = tk.StringVar(value="global")
         self.quality_var = tk.DoubleVar(value=0.75)
+        self.jibberish_var = tk.DoubleVar(value=0.4)
+        self.clarity_var = tk.DoubleVar(value=0.4)
+        self.timing_instability_var = tk.DoubleVar(value=0.35)
+        self.allow_full_gibberish_var = tk.BooleanVar(value=False)
         self.max_phoneme_distance_var = tk.StringVar(value=DEFAULT_GLOBAL_BLABBER_MAX_PHONEME_DISTANCE)
         self.transcript_var = tk.StringVar(value="bath")
         self.breakpoints_var = tk.StringVar(value="auto")
@@ -1325,6 +1383,10 @@ class SpeechDistortionGui:
         self._build_ui()
         self.transcript_var.trace_add("write", self._on_transcript_change)
         self.quality_var.trace_add("write", self._on_blabber_inputs_changed)
+        self.jibberish_var.trace_add("write", self._on_blabber_inputs_changed)
+        self.clarity_var.trace_add("write", self._on_blabber_inputs_changed)
+        self.timing_instability_var.trace_add("write", self._on_blabber_inputs_changed)
+        self.allow_full_gibberish_var.trace_add("write", self._on_blabber_inputs_changed)
         self.mode_var.trace_add("write", self._on_mode_changed)
         self.quality_mode_var.trace_add("write", self._on_blabber_inputs_changed)
         self.max_phoneme_distance_var.trace_add("write", self._on_blabber_inputs_changed)
@@ -1397,6 +1459,7 @@ class SpeechDistortionGui:
             ("Volume dropout", "volume_dropout"),
             ("Phone style", "phone_style"),
             ("Blabber", "blabber"),
+            ("Pronunciation safe", "pronunciation_safe"),
         ):
             ttk.Radiobutton(
                 mode_frame,
@@ -1532,6 +1595,29 @@ class SpeechDistortionGui:
         self.quality_label = ttk.Label(slider_frame, width=6, text="0.75")
         self.quality_label.pack(side=tk.LEFT, padx=(8, 0))
 
+        self.pronunciation_slider_frame = ttk.LabelFrame(container, text="Pronunciation Sliders", padding=12)
+        self.pronunciation_slider_frame.pack(fill=tk.X, pady=(12, 0))
+        self._build_pronunciation_slider_row(
+            self.pronunciation_slider_frame,
+            "Jibberish",
+            self.jibberish_var,
+        )
+        self._build_pronunciation_slider_row(
+            self.pronunciation_slider_frame,
+            "Clarity",
+            self.clarity_var,
+        )
+        self._build_pronunciation_slider_row(
+            self.pronunciation_slider_frame,
+            "Timing instability",
+            self.timing_instability_var,
+        )
+        ttk.Checkbutton(
+            self.pronunciation_slider_frame,
+            text="Allow full gibberish override",
+            variable=self.allow_full_gibberish_var,
+        ).pack(anchor=tk.W, pady=(8, 0))
+
         info_frame = ttk.LabelFrame(container, text="Status", padding=12)
         info_frame.pack(fill=tk.BOTH, expand=True, pady=(16, 0))
         self.output_text = ScrolledText(info_frame, wrap=tk.WORD, height=12)
@@ -1553,6 +1639,29 @@ class SpeechDistortionGui:
         self._sync_quality_label()
         self._update_mode_state()
         self._update_quality_mode_state()
+
+    def _build_pronunciation_slider_row(
+        self,
+        parent: ttk.Frame,
+        label_text: str,
+        variable: tk.DoubleVar,
+    ) -> None:
+        row = ttk.Frame(parent)
+        row.pack(fill=tk.X, pady=2)
+        ttk.Label(row, text=label_text, width=18).pack(side=tk.LEFT)
+        scale = ttk.Scale(
+            row,
+            from_=0.0,
+            to=1.0,
+            variable=variable,
+            orient=tk.HORIZONTAL,
+        )
+        scale.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        value_label = ttk.Label(row, width=6, text=f"{variable.get():.2f}")
+        value_label.pack(side=tk.LEFT, padx=(8, 0))
+        scale.configure(
+            command=lambda _value, var=variable, label=value_label: label.configure(text=f"{var.get():.2f}")
+        )
 
     def _on_scrollable_frame_configure(self, _event: tk.Event[tk.Misc]) -> None:
         if self.scroll_canvas is None or self.scroll_container is None:
@@ -1666,11 +1775,17 @@ class SpeechDistortionGui:
 
     def _update_quality_mode_state(self) -> None:
         use_per_phoneme = self.quality_mode_var.get() == "per_phoneme"
+        pronunciation_mode = self.mode_var.get() == "pronunciation_safe"
+        if pronunciation_mode:
+            use_per_phoneme = False
         if use_per_phoneme:
             self.global_quality_scale.state(["disabled"])
             self.max_phoneme_distance_combo.state(["disabled"])
         else:
-            self.global_quality_scale.state(["!disabled"])
+            if pronunciation_mode:
+                self.global_quality_scale.state(["disabled"])
+            else:
+                self.global_quality_scale.state(["!disabled"])
             if self.mode_var.get() == "blabber":
                 self.max_phoneme_distance_combo.state(["!disabled", "readonly"])
             else:
@@ -1678,7 +1793,7 @@ class SpeechDistortionGui:
         for child in self.phoneme_controls_frame.winfo_children():
             for grandchild in child.winfo_children():
                 if isinstance(grandchild, ttk.Scale):
-                    if use_per_phoneme:
+                    if use_per_phoneme and not pronunciation_mode:
                         grandchild.state(["!disabled"])
                     else:
                         grandchild.state(["disabled"])
@@ -1689,6 +1804,7 @@ class SpeechDistortionGui:
         self.subtitle_var.set(subtitle_text_for_mode(mode))
         self._sync_quality_label()
         self.transcript_entry.state(["!disabled"])
+        pronunciation_mode = mode == "pronunciation_safe"
         if mode == "phone_style":
             self.phone_style_combo.state(["!disabled", "readonly"])
         else:
@@ -1724,6 +1840,10 @@ class SpeechDistortionGui:
             self.style_transfer_target_combo.state(["!disabled", "readonly"])
         else:
             self.style_transfer_target_combo.state(["disabled"])
+        if pronunciation_mode:
+            self.pronunciation_slider_frame.state(["!disabled"])
+        else:
+            self.pronunciation_slider_frame.state(["disabled"])
         self._update_quality_mode_state()
 
     def _invalidate_blabber_sequence(self) -> None:
@@ -2080,6 +2200,15 @@ class SpeechDistortionGui:
                         transcript,
                         phoneme_qualities,
                     )
+            elif mode == "pronunciation_safe":
+                self.rendered_audio = render_pronunciation_safe(
+                    self.current_audio,
+                    transcript,
+                    jibberish=max(0.0, min(1.0, float(self.jibberish_var.get()))),
+                    clarity=max(0.0, min(1.0, float(self.clarity_var.get()))),
+                    timing_instability=max(0.0, min(1.0, float(self.timing_instability_var.get()))),
+                    allow_full_gibberish=bool(self.allow_full_gibberish_var.get()),
+                )
             else:
                 cached_sequence = self._get_cached_blabber_sequence()
                 if use_per_phoneme:
@@ -2187,9 +2316,12 @@ class SpeechDistortionGui:
         metadata = self.rendered_audio.metadata
         details = [
             f"Rendered {mode}",
-            f"Quality: {quality:.2f}" if not use_per_phoneme else "Quality: per-phoneme",
         ]
-        details.append(f"Quality mode: {'per-phoneme' if use_per_phoneme else 'global'}")
+        if mode == "pronunciation_safe":
+            details.append("Quality mode: pronunciation-safe sliders")
+        else:
+            details.append(f"Quality: {quality:.2f}" if not use_per_phoneme else "Quality: per-phoneme")
+            details.append(f"Quality mode: {'per-phoneme' if use_per_phoneme else 'global'}")
         if mode == "volume_dropout":
             details.append(f"Dropped: {metadata.get('drop_percent', '0.0')}%")
         if "noise_type" in metadata:
@@ -2211,6 +2343,25 @@ class SpeechDistortionGui:
                 details.append(f"Style target: {metadata['style_transfer_target_voice']}")
             if metadata.get("style_transfer_status"):
                 details.append(f"Style status: {metadata['style_transfer_status']}")
+        if mode == "pronunciation_safe":
+            details.append(f"Jibberish: {metadata.get('jibberish', '0.000')}")
+            details.append(f"Clarity: {metadata.get('clarity', '0.000')}")
+            details.append(f"Timing instability: {metadata.get('timing_instability', '0.000')}")
+            details.append(
+                "Full gibberish override: "
+                + ("yes" if metadata.get("allow_full_gibberish") == "1" else "no")
+            )
+            if metadata.get("pronunciation_similarity_score"):
+                details.append(
+                    "Similarity: "
+                    f"{metadata['pronunciation_similarity_score']} / {metadata.get('pronunciation_similarity_threshold', 'n/a')}"
+                )
+            if metadata.get("pronunciation_fragment_count"):
+                details.append(f"Projected fragments: {metadata['pronunciation_fragment_count']}")
+            if metadata.get("editor_name"):
+                details.append(f"Editor: {metadata['editor_name']}")
+            if metadata.get("assembler_name"):
+                details.append(f"Assembler: {metadata['assembler_name']}")
         if "breakpoints" in metadata:
             details.append(f"Breakpoints: {metadata['breakpoints']}")
         if "transcript" in metadata:
