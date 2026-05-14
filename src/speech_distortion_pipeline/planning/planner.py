@@ -32,6 +32,7 @@ from speech_distortion_pipeline.models import (
 )
 from speech_distortion_pipeline.phonology import GraphemeToPhoneme
 from .evidence import HeuristicDistanceEvidenceComputer
+from .triphone import HeuristicTriphoneTraversalEngine
 
 PHONE_THOLD = 1.0 # 0.55
 MAX_CANDIDATES_0 = 12
@@ -292,6 +293,9 @@ class HeuristicHybridPlanner:
     def __post_init__(self) -> None:
         self._rng = random.Random(self.config.global_constraints.random_seed)
         self._evidence_computer = HeuristicDistanceEvidenceComputer(config=self.config)
+        self._triphone_engine = HeuristicTriphoneTraversalEngine(
+            evidence_computer=self._evidence_computer
+        )
 
     def plan(
         self,
@@ -327,14 +331,30 @@ class HeuristicHybridPlanner:
 
         candidates: List[CandidateScore] = []
         selected_candidates: List[CandidateScore] = []
+        traversal_paths = []
         operations: List[EditOperation] = []
         for skeleton in skeletons:
             word_candidates = self._build_candidate_scores(
                 skeleton,
                 slider_estimates["jibberish"],
                 controls,
+                acoustic_features=distance_evidence.get(
+                    "acoustic_embedding_distance",
+                    DistanceSignal(name="acoustic_embedding_distance", value=0.0),
+                ).raw_features,
             )
             candidates.extend(word_candidates)
+            traversal_paths.extend(
+                self._triphone_engine.generate_paths(
+                    skeleton=skeleton,
+                    jibberish_value=slider_estimates["jibberish"].value,
+                    acoustic_features=distance_evidence.get(
+                        "acoustic_embedding_distance",
+                        DistanceSignal(name="acoustic_embedding_distance", value=0.0),
+                    ).raw_features,
+                    max_paths=8,
+                )
+            )
             selected = self._select_candidate(skeleton, word_candidates, slider_estimates["jibberish"])
             selected_candidates.append(selected)
             operations.extend(
@@ -379,6 +399,7 @@ class HeuristicHybridPlanner:
             evidence_bundle=evidence_bundle,
             candidates=candidates,
             selected_candidates=selected_candidates,
+            traversal_paths=traversal_paths,
             trace=self._build_trace(
                 skeletons=skeletons,
                 operations=operations,
@@ -389,6 +410,7 @@ class HeuristicHybridPlanner:
                 similarity=similarity,
                 candidates=candidates,
                 evidence_bundle=evidence_bundle,
+                traversal_paths=traversal_paths,
             ),
         )
 
@@ -467,7 +489,11 @@ class HeuristicHybridPlanner:
         )
 
     def _build_candidate_scores(
-        self, skeleton: PronunciationSkeleton, jibberish_estimate: SliderEstimate, controls: SliderControls
+        self,
+        skeleton: PronunciationSkeleton,
+        jibberish_estimate: SliderEstimate,
+        controls: SliderControls,
+        acoustic_features: Optional[Dict[str, object]] = None,
     ) -> List[CandidateScore]:
         threshold = self._candidate_similarity_threshold(skeleton, controls)
         max_safe_phoneme_distance = 0.55
@@ -477,6 +503,21 @@ class HeuristicHybridPlanner:
             max_safe_phoneme_distance = 0.62
         candidates: List[CandidateScore] = []
         duration_shape_similarity = max(0.0, 1.0 - min(1.0, controls.distance_overrides.get("duration_shape_distance", 0.0)))
+        traversal_paths = self._triphone_engine.generate_paths(
+            skeleton=skeleton,
+            jibberish_value=jibberish_estimate.value,
+            acoustic_features=dict(acoustic_features or {}),
+            max_paths=max(MAX_CANDIDATES_0, int(round(6 + (jibberish_estimate.value * 10)))),
+        )
+        candidates.extend(
+            self._triphone_engine.candidate_scores_from_paths(
+                skeleton=skeleton,
+                paths=traversal_paths,
+                duration_shape_similarity=duration_shape_similarity,
+                similarity_threshold=threshold,
+                max_safe_phoneme_distance=max_safe_phoneme_distance,
+            )
+        )
         for variant in self._generate_grapheme_candidates(skeleton.word, jibberish_estimate.value):
             phones = self.g2p.phonemize(variant.replace("-", " "))
             phoneme_distance = self._phoneme_distance(skeleton.phone_sequence, phones, skeleton)
@@ -498,11 +539,31 @@ class HeuristicHybridPlanner:
                     pronunciation_similarity=pronunciation_similarity,
                     accepted=accepted,
                     rejection_reason=rejection_reason,
+                    traversal_source="grapheme_fallback",
                 )
             )
+        deduped: Dict[tuple[str, tuple[str, ...]], CandidateScore] = {}
+        for candidate in candidates:
+            key = (candidate.grapheme, tuple(candidate.phones))
+            existing = deduped.get(key)
+            if existing is None:
+                deduped[key] = candidate
+                continue
+            if (
+                candidate.accepted and not existing.accepted
+            ) or (
+                candidate.accepted == existing.accepted
+                and (
+                    candidate.pronunciation_similarity > existing.pronunciation_similarity
+                    or candidate.phoneme_distance < existing.phoneme_distance
+                )
+            ):
+                deduped[key] = candidate
+        candidates = list(deduped.values())
         candidates.sort(
             key=lambda item: (
                 not item.accepted,
+                0 if item.traversal_source in {"symbolic_first", "hubert_first"} else 1,
                 -(item.pronunciation_similarity),
                 item.phoneme_distance,
                 -item.grapheme_distance,
@@ -539,6 +600,13 @@ class HeuristicHybridPlanner:
             )
             return accepted[0]
 
+        if jibberish_estimate.value >= 0.6:
+            contextual_accepted = [
+                item for item in accepted if item.traversal_source in {"symbolic_first", "hubert_first"}
+            ]
+            if contextual_accepted:
+                accepted = contextual_accepted
+
         if jibberish_estimate.value >= 0.75:
             strongly_mutated = [
                 item
@@ -548,6 +616,7 @@ class HeuristicHybridPlanner:
                     item.grapheme_distance >= 0.42
                     or abs(len(item.grapheme) - len(skeleton.word)) >= 2
                     or "-" in item.grapheme
+                    or item.traversal_source in {"symbolic_first", "hubert_first"}
                 )
             ]
             if strongly_mutated:
@@ -576,6 +645,8 @@ class HeuristicHybridPlanner:
                         * 0.16
                     )
                     + ((1.0 if item.grapheme != skeleton.word else 0.0) * 0.12 * jibberish_estimate.value)
+                    + (0.05 if item.traversal_source == "hubert_first" else 0.0)
+                    + (0.03 if item.traversal_source == "symbolic_first" else 0.0)
                 ),
                 item.grapheme == skeleton.word and jibberish_estimate.value >= 0.45,
                 item.grapheme,
@@ -1006,6 +1077,7 @@ class HeuristicHybridPlanner:
         similarity: PronunciationSimilarityScore,
         candidates: List[CandidateScore],
         evidence_bundle: DistanceEvidenceBundle,
+        traversal_paths: List[object],
     ) -> DecisionTrace:
         primary_skeleton = skeletons[0]
         primary_candidate = selected_candidates[0] if selected_candidates else CandidateScore(
@@ -1043,6 +1115,19 @@ class HeuristicHybridPlanner:
             acoustic_model_compatibility=str(
                 distance_evidence.get("acoustic_embedding_distance", DistanceSignal(name="acoustic_embedding_distance", value=0.0)).raw_features.get("acoustic_model_compatibility", "unavailable")
             ),
+            traversal_mode=primary_candidate.traversal_source,
+            traversal_source=primary_candidate.traversal_source,
+            traversal_path=[
+                "{0}:{1}:{2}>{3}>{4}".format(
+                    path.mode,
+                    getattr(path, "proposal_source", ""),
+                    state.left,
+                    state.center,
+                    state.right,
+                )
+                for path in traversal_paths[:2]
+                for state in getattr(path, "states", [])[:6]
+            ],
             edits=[
                 "{0}:{1}".format(operation.edit_type.value, ",".join(str(index) for index in operation.target_phone_indices))
                 for operation in operations

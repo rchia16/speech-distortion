@@ -6,12 +6,14 @@ from .factory import (
 )
 from .evidence import HeuristicDistanceEvidenceComputer
 from .planner import ErrorPlanner, HeuristicErrorPlanner, HeuristicHybridPlanner, HybridPlanner
+from .triphone import HeuristicTriphoneTraversalEngine
 
 __all__ = [
     "ErrorPlanner",
     "HeuristicDistanceEvidenceComputer",
     "HeuristicErrorPlanner",
     "HeuristicHybridPlanner",
+    "HeuristicTriphoneTraversalEngine",
     "HybridPlanner",
     "build_error_planner",
     "build_hybrid_planner",

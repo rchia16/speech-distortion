@@ -40,6 +40,8 @@ def test_pronunciation_planner_anchors_all_phones_for_short_word() -> None:
     assert skeleton.phone_sequence == ["N", "OW"]
     assert skeleton.anchor_phone_indices == skeleton.phone_indices
     assert plan.similarity.passed is True
+    assert plan.traversal_paths
+    assert any(path.mode in {"symbolic_first", "hubert_first"} for path in plan.traversal_paths)
 
 
 def test_high_clarity_keeps_symbolic_plan_empty() -> None:
@@ -296,6 +298,13 @@ def test_plan_exposes_distance_features_and_routing() -> None:
     assert "jibberish" in plan.trace.routing_rules
     assert "acoustic_backend" in plan.distance_evidence["acoustic_embedding_distance"].raw_features
     assert plan.trace.acoustic_model_compatibility
+    assert plan.trace.traversal_source in {"symbolic_first", "hubert_first", "grapheme_fallback", ""}
+    assert isinstance(plan.trace.traversal_path, list)
+    contextual_paths = [path for path in plan.traversal_paths if path.mode in {"symbolic_first", "hubert_first"}]
+    assert contextual_paths
+    if any(path.mode == "hubert_first" for path in contextual_paths):
+        assert any(path.proposal_source == "hubert_reference_bank" for path in contextual_paths if path.mode == "hubert_first")
+        assert any(path.reference_neighbors for path in contextual_paths if path.mode == "hubert_first")
 
 
 def test_acoustic_backend_metadata_exposes_proxy_fallback_or_loaded_model() -> None:

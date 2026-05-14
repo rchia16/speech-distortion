@@ -1,13 +1,20 @@
 from __future__ import annotations
 
 import os
+from sys import platform
 from dataclasses import dataclass
 from typing import Final, Literal
 
 
-DEFAULT_GUI_INPUT_FILENAME: Final[str] = "D:/Ray/OneDrive - UTS/Projects/"\
-        "eeg2text/Assets/en.text-to-speech.online/aus-en_woman/"\
-        "aus-en_woman_bath_trim.wav"
+if 'win' in platform:
+    DEFAULT_GUI_INPUT_FILENAME: Final[str] = "D:/Ray/OneDrive - UTS/Projects/"\
+            "eeg2text/Assets/en.text-to-speech.online/aus-en_woman/"\
+            "aus-en_woman_bath_trim.wav"
+else:
+    DEFAULT_GUI_INPUT_FILENAME: Final[str] = "/data/raqchia/audio-assets/" \
+            "en.text-to-speech.online/aus-en_woman/"\
+            "aus-en_woman_bath.wav"
+
 
 COQUI_ENV_NAME: Final[str] = os.environ.get("BLABBER_CONDA_ENV", "coqui-blabber")
 COQUI_WOMAN_MODEL_NAME: Final[str] = os.environ.get(

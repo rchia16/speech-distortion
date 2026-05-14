@@ -20,6 +20,10 @@ from .pronunciation import (
     SliderControls,
     SliderEstimate,
     TimingInstabilityPlan,
+    TraversalPath,
+    TriphoneEdge,
+    TriphoneFeatureVector,
+    TriphoneState,
 )
 from .timing import DurationBudget, TimingPlan
 
@@ -54,6 +58,10 @@ __all__ = [
     "SliderEstimate",
     "TimingPlan",
     "TimingInstabilityPlan",
+    "TraversalPath",
+    "TriphoneEdge",
+    "TriphoneFeatureVector",
+    "TriphoneState",
     "WordComplexity",
     "WordSpan",
 ]

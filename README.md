@@ -492,6 +492,7 @@ Notes:
 - override the ACN model path with `ACN_EMBED_MODEL_DIR`
 - regenerate `phoneme_distances.json` after exporter changes if you want live GUI/library behavior to use the newest numeric distances
 - regenerate `phoneme_distances.json` if you see `per_phone_reference_warning=1`, because legacy candidate ordering can make per-phoneme ladders less smooth
+- working towards hybrid phoneme grapheme --> no, mow, nouh, nowe, nheow 
 
 ## Notes And Limitations
 

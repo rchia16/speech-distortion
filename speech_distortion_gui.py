@@ -78,6 +78,7 @@ from speech_distortion_pipeline.resynthesis.style_transfer import (
 )
 DEFAULT_INPUT = ROOT / DEFAULT_GUI_INPUT_FILENAME
 DEFAULT_PRONUNCIATION_SLIDER_CONFIG = ROOT / "hybrid.yaml"
+DEFAULT_PRONUNCIATION_CACHE_ROOT = Path("/data/raqchia/audio-assets/.cache")
 MAX_DROPOUT_FRACTION = 0.8
 MAX_DROPOUT_SILENCE_MS = 200.0
 GLOBAL_BLABBER_MAX_PHONEME_DISTANCE_VALUES = tuple(f"{value / 10.0:.1f}" for value in range(8, 101))
@@ -1275,9 +1276,22 @@ def render_pronunciation_safe(
     clarity: float,
     timing_instability: float,
     allow_full_gibberish: bool = False,
+    voice_mode: str = "woman",
+    backend_voice: str | None = None,
 ) -> AudioBuffer:
     config = load_hybrid_config(slider_config_path)
     runtime = build_hybrid_stitching_slice(config)
+    normalized_voice_mode = normalize_blabber_voice_mode(voice_mode)
+    cache_partition = "woman"
+    if normalized_voice_mode == "man":
+        cache_partition = "man"
+    elif normalized_voice_mode == "source_clone":
+        cache_partition = "source"
+    triphone_engine = runtime.planner._triphone_engine
+    triphone_engine.cache_root = str(DEFAULT_PRONUNCIATION_CACHE_ROOT / cache_partition)
+    if backend_voice:
+        triphone_engine.bank_voice = backend_voice
+    triphone_engine.__post_init__()
     alignment = runtime.aligner.align(audio, transcript)
     graph = runtime.feature_extractor.build_phone_graph(alignment)
     controls = build_slider_controls(
@@ -1307,6 +1321,9 @@ def render_pronunciation_safe(
             "clarity": f"{clarity:.3f}",
             "timing_instability": f"{timing_instability:.3f}",
             "allow_full_gibberish": "1" if allow_full_gibberish else "0",
+            "voice_mode": normalized_voice_mode,
+            "pronunciation_cache_root": str(DEFAULT_PRONUNCIATION_CACHE_ROOT / cache_partition),
+            "pronunciation_cache_partition": cache_partition,
             "pronunciation_similarity_score": f"{plan.similarity.score:.4f}",
             "pronunciation_similarity_threshold": f"{plan.similarity.threshold:.4f}",
             "pronunciation_fragment_count": str(len(projected)),
@@ -1356,7 +1373,7 @@ class SpeechDistortionGui:
     def __init__(self, root: tk.Tk):
         self.root = root
         self.root.title("Speech Distortion GUI")
-        self.root.geometry("760x1080")
+        self.root.geometry("1000x1080")
         self.scroll_canvas: tk.Canvas | None = None
         self.scroll_container: ttk.Frame | None = None
 
@@ -2341,6 +2358,8 @@ class SpeechDistortionGui:
                     clarity=max(0.0, min(1.0, float(self.clarity_var.get()))),
                     timing_instability=max(0.0, min(1.0, float(self.timing_instability_var.get()))),
                     allow_full_gibberish=bool(self.allow_full_gibberish_var.get()),
+                    voice_mode=voice_mode,
+                    backend_voice=backend_voice,
                 )
             else:
                 cached_sequence = self._get_cached_blabber_sequence()
@@ -2480,6 +2499,9 @@ class SpeechDistortionGui:
             details.append(f"Jibberish: {metadata.get('jibberish', '0.000')}")
             details.append(f"Clarity: {metadata.get('clarity', '0.000')}")
             details.append(f"Timing instability: {metadata.get('timing_instability', '0.000')}")
+            details.append(f"Voice mode: {metadata.get('voice_mode', 'woman')}")
+            if metadata.get("pronunciation_cache_partition"):
+                details.append(f"Cache partition: {metadata['pronunciation_cache_partition']}")
             details.append(
                 "Full gibberish override: "
                 + ("yes" if metadata.get("allow_full_gibberish") == "1" else "no")

@@ -59,6 +59,59 @@ class CandidateScore:
     pronunciation_similarity: float = 0.0
     accepted: bool = False
     rejection_reason: str = ""
+    traversal_source: str = ""
+    cost_breakdown: dict[str, float] = field(default_factory=dict)
+
+
+@dataclass
+class TriphoneState:
+    left: str
+    center: str
+    right: str
+    left_boundary: bool = False
+    right_boundary: bool = False
+    stress: Optional[str] = None
+    syllable_role: str = ""
+    word_position: int = 0
+
+
+@dataclass
+class TriphoneFeatureVector:
+    center_features: dict[str, Any] = field(default_factory=dict)
+    left_right_compatibility: float = 0.0
+    sonority_transition: float = 0.0
+    consonant_cluster_legality: float = 0.0
+    vowel_harmony: float = 0.0
+    syllable_role_score: float = 0.0
+    phonotactic_likelihood: float = 0.0
+
+
+@dataclass
+class TriphoneEdge:
+    source: TriphoneState
+    target: TriphoneState
+    edge_cost: float
+    feature_similarity: float
+    phonotactic_likelihood: float
+    hubert_weight: float
+    perceptual_inertia: float
+    cost_breakdown: dict[str, float] = field(default_factory=dict)
+
+
+@dataclass
+class TraversalPath:
+    mode: str
+    proposal_source: str = ""
+    states: list[TriphoneState] = field(default_factory=list)
+    edges: list[TriphoneEdge] = field(default_factory=list)
+    phones: list[str] = field(default_factory=list)
+    grapheme: str = ""
+    total_cost: float = 0.0
+    naturalness_score: float = 0.0
+    continuity_score: float = 0.0
+    diversity_score: float = 0.0
+    reference_neighbors: list[str] = field(default_factory=list)
+    feature_breakdown: dict[str, float] = field(default_factory=dict)
 
 
 @dataclass
@@ -78,6 +131,9 @@ class DecisionTrace:
     acoustic_model_path: str = ""
     acoustic_model_loaded: bool = False
     acoustic_model_compatibility: str = "unavailable"
+    traversal_mode: str = ""
+    traversal_source: str = ""
+    traversal_path: list[str] = field(default_factory=list)
     edits: list[str] = field(default_factory=list)
     rejected_candidates: list[str] = field(default_factory=list)
     repair_actions: list[str] = field(default_factory=list)
@@ -167,6 +223,7 @@ class PronunciationSafePlan:
     evidence_bundle: Optional[DistanceEvidenceBundle] = None
     candidates: list[CandidateScore] = field(default_factory=list)
     selected_candidates: list[CandidateScore] = field(default_factory=list)
+    traversal_paths: list[TraversalPath] = field(default_factory=list)
     trace: Optional[DecisionTrace] = None
 
 
