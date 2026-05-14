@@ -2,12 +2,13 @@
 Guide:
     * selection first filters candidates by voice mode (female vs male), word/label,
     and candidate (global vs per-phoneme).
-    * Load one candidate and uses source phoneme alignment to convert the EEG
-    mismatch to per-phoneme mismatch via compute_per_phoneme_mismatch
-    * for global, collapse by taking mean and then take the closest one
+    * For triphone global search, collapse the EEG temporal mismatch wave to one
+    whole-word target level, then search the word's triphone library.
 """
 from pathlib import Path
+import os
 import pprint
+import sys
 
 from Template_l2_compare_v2 import (
     compare_signal_to_prebuilt_template,
@@ -16,26 +17,99 @@ from Template_l2_compare_v2 import (
 )
 from select_blabber_asset import (
     adapt_comparison_result,
-    load_asset_index,
     normalize_voice_mode,
-    scan_asset_root,
-    select_asset,
 )
+
+TRIPHONE_SELECTOR_DIR = Path(r"C:\Users\rchia\Downloads\test\solutions")
+if TRIPHONE_SELECTOR_DIR.exists() and str(TRIPHONE_SELECTOR_DIR) not in sys.path:
+    sys.path.insert(0, str(TRIPHONE_SELECTOR_DIR))
+
+from select_blabber_asset_triphone import load_assets, select_assets
 
 
 REQUESTED_VOICE = "female"
-ROOT_PATH = Path("/data/raqchia/audio-assets/speech-assets") 
-OUTPUT_PATH = ROOT_PATH / Path(REQUESTED_VOICE)
-ASSET_INDEX_PATH: Path | None = OUTPUT_PATH / Path("blabber_asset_index.json")
+TRIPHONE_ASSET_ROOT = Path(
+    os.environ.get(
+        "TRIPHONE_ASSET_ROOT",
+        r"C:\Users\rchia\Downloads\test\speech-assets-triphone",
+    )
+)
 GENERATION_MODE = "global"
+TRIPHONE_LEVEL_WEIGHT = 6.0
+
+LEXICON = {
+    "go": ["G", "OW"],
+    "stop": ["S", "T", "OW", "P"],
+    "bath": ["B", "AE", "TH"],
+    "food": ["F", "UW", "D"],
+    "yes": ["Y", "EH", "S"],
+    "no": ["N", "OW"],
+    "pain": ["P", "EY", "N"],
+    "help": ["HH", "EH", "L", "P"],
+}
 
 
-def load_candidates():
-    if ASSET_INDEX_PATH is not None:
-        return load_asset_index(ASSET_INDEX_PATH)
-    if OUTPUT_PATH is not None:
-        return scan_asset_root(OUTPUT_PATH)
-    raise ValueError("Set ASSET_INDEX_PATH or OUTPUT_PATH before running my_test.py.")
+def clamp_unit(value: float) -> float:
+    return max(0.0, min(1.0, float(value)))
+
+
+def global_target_level(comparison: dict) -> float:
+    values = [float(value) for value in comparison["per_time_l2"]]
+    if not values:
+        return 0.0
+    return clamp_unit(sum(values) / float(len(values)))
+
+
+def library_json_path(word: str, voice_mode: str) -> Path:
+    return TRIPHONE_ASSET_ROOT / voice_mode / GENERATION_MODE / word / f"{word}_blabber_scored.json"
+
+
+def select_triphone_global_asset(comparison: dict, requested_voice: str) -> dict:
+    word = str(comparison.get("label_name") or "").strip().lower()
+    if word not in LEXICON:
+        raise ValueError(f"No canonical phone sequence configured for word '{word}'.")
+
+    voice_mode = normalize_voice_mode(requested_voice)
+    library_path = library_json_path(word, voice_mode)
+    if not library_path.is_file():
+        raise FileNotFoundError(f"Missing triphone library JSON: {library_path}")
+
+    target_level = global_target_level(comparison)
+    assets, _payload = load_assets(library_path)
+    selected = select_assets(
+        assets,
+        word=word,
+        phones=LEXICON[word],
+        triphones=[],
+        voice=voice_mode,
+        target_level=target_level,
+        min_level=None,
+        max_level=None,
+        top_k=1,
+        level_weight=TRIPHONE_LEVEL_WEIGHT,
+        global_search=True,
+    )
+    if not selected:
+        raise ValueError(f"No triphone assets matched word='{word}' voice='{voice_mode}'.")
+
+    best = selected[0]
+    asset = best["asset"]
+    return {
+        "word": word,
+        "voice_mode": voice_mode,
+        "generation_mode": GENERATION_MODE,
+        "library_json": str(library_path),
+        "audio_path": asset.get("audio_path") or asset.get("wav_path") or asset.get("output_audio_path"),
+        "asset_id": asset.get("asset_id"),
+        "target_level": target_level,
+        "requested_generation_signature": [target_level],
+        "selected_phoneme_grades": asset.get("phoneme_values", [asset.get("level")]),
+        "score": best["score"],
+        "score_details": best["score_details"],
+        "asset_metadata": asset,
+        "times": list(comparison["times"]),
+        "per_time_l2": list(comparison["per_time_l2"]),
+    }
 
 
 if __name__ == "__main__":
@@ -74,15 +148,13 @@ if __name__ == "__main__":
 
     comparison = adapt_comparison_result(result)
     pprint.pprint(comparison)
-    candidates = load_candidates()
-    selection = select_asset(
+    selection = select_triphone_global_asset(
         comparison=comparison,
-        candidates=candidates,
-        requested_voice=normalize_voice_mode(REQUESTED_VOICE),
-        generation_mode=GENERATION_MODE,
+        requested_voice=REQUESTED_VOICE,
     )
 
     print("Selected asset:", selection["audio_path"])
-    print("Selected sidecar:", selection["sidecar_path"])
+    print("Selected asset id:", selection["asset_id"])
     print("Generation mode:", selection["generation_mode"])
-    print("Phoneme scores:", selection["phoneme_scores"])
+    print("Target level:", selection["target_level"])
+    print("Score details:", selection["score_details"])
